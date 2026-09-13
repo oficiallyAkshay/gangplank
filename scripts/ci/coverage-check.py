@@ -99,6 +99,18 @@ def totals(coverable, executed, lines_by_file=None):
     return covered, total
 
 
+def uncovered_lines(coverable, executed, lines_by_file=None):
+    # Same "wanted" selection as totals(), but returns the individual
+    # file:line entries that are coverable-and-wanted yet never traced,
+    # sorted for stable, greppable --list-uncovered output.
+    out = []
+    for canon, cov_lines in sorted(coverable.items()):
+        wanted = cov_lines if lines_by_file is None else (lines_by_file.get(canon, set()) & cov_lines)
+        for lineno in sorted(wanted - executed.get(canon, set())):
+            out.append(f"{canon}:{lineno}")
+    return out
+
+
 def main():
     p = argparse.ArgumentParser(description="Line and changed-line coverage over bin/, from bash's own xtrace output.")
     p.add_argument("--trace", default="coverage/trace.log", help="trace file written by scripts/ci/trace.sh")
@@ -106,6 +118,11 @@ def main():
     p.add_argument("--base", help="ref to diff against for changed-line coverage; omit to skip that bar")
     p.add_argument("--diff-file", help="unified diff to use instead of running git (for tests)")
     p.add_argument("--min-changed", type=float, help="fail if changed-line coverage drops below this percent")
+    p.add_argument(
+        "--list-uncovered", action="store_true",
+        help="print file:line for each uncovered changed line (needs --base or --diff-file); "
+             "falls back to every uncovered coverable line in bin/ when neither is given",
+    )
     args = p.parse_args()
 
     repo_root = os.path.abspath(args.repo_root)
@@ -135,6 +152,11 @@ def main():
 
     changed_part = f"changed={changed_pct}% ({changed_covered}/{changed_total})" if changed_pct is not None else "changed=n/a"
     print(f"total={total_pct}% {changed_part}")
+
+    if args.list_uncovered:
+        lines_by_file = parse_added_lines(diff_text) if diff_text is not None else None
+        for entry in uncovered_lines(coverable, executed, lines_by_file):
+            print(entry)
 
     return 1 if (args.min_changed is not None and changed_total > 0 and changed_pct < args.min_changed) else 0
 
