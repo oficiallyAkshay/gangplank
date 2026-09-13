@@ -3,12 +3,12 @@
 # check   shellcheck + actionlint (if present) + tests
 # test    tests/run.sh alone
 # lint    shellcheck + actionlint (if present), no tests
-# coverage  tests/run.sh under kcov + scripts/ci/coverage-check.py (if
-#           kcov present), else prints how to get it
+# coverage  tests/run.sh under bash's own line tracing +
+#           scripts/ci/coverage-check.py — no kcov, no container
 
 SHELL := /bin/bash
 
-SH_SCRIPTS := $(wildcard bin/*) $(wildcard examples/*.sh) $(wildcard tests/*.sh)
+SH_SCRIPTS := $(wildcard bin/*) $(wildcard examples/*.sh) $(wildcard tests/*.sh) $(wildcard scripts/ci/*.sh)
 WORKFLOW_FILES := $(wildcard .github/workflows/*.yml)
 
 .PHONY: check test lint coverage
@@ -37,13 +37,6 @@ lint:
 	# third-party uses:, no checkout).
 
 coverage:
-	@if command -v kcov >/dev/null 2>&1; then \
-		mkdir -p coverage; \
-		kcov --include-path=bin coverage tests/run.sh; \
-		python3 scripts/ci/coverage-check.py; \
-	else \
-		echo "kcov not found. Install it to measure coverage locally:"; \
-		echo "  macOS:  brew install kcov"; \
-		echo "  Linux:  see https://github.com/SimonKagstrom/kcov#installing"; \
-		echo "CI always runs coverage regardless of what's installed here."; \
-	fi
+	@mkdir -p coverage
+	GANGPLANK_TRACE_FILE="$(CURDIR)/coverage/trace.log" bash tests/run.sh
+	python3 scripts/ci/coverage-check.py --trace coverage/trace.log

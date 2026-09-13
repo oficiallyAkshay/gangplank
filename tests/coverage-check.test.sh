@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # tests/coverage-check.test.sh — scripts/ci/coverage-check.py against a
-# hand-written cobertura fixture (two reports, merged by max hits) and a
-# fake diff (--diff-file, no real git needed): both numbers land right,
-# and both exit paths (pass, fail on --min-changed) fire correctly.
+# hand-written xtrace file (a fake bin/deploy.sh plus "+trace:" lines, no
+# real bash run needed) and a fake diff (--diff-file, no real git
+# needed): both numbers land right, and both exit paths (pass, fail on
+# --min-changed) fire correctly. A separate end-to-end case at the
+# bottom runs a real traced test file through tests/run.sh.
 
 set -o pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,27 +18,33 @@ require_script "$SCRIPT"
 command -v python3 >/dev/null 2>&1 || { echo "SKIP - python3 not on PATH"; exit 0; }
 
 dir="$(new_tmpdir)"
-mkdir -p "$dir/coverage/kcov-bin1" "$dir/coverage/kcov-bin2"
+mkdir -p "$dir/bin" "$dir/coverage"
 
-# Two kcov reports for the same file: merging takes the max hit count
-# per line, so line 10 (missed in bin1, hit in bin2) ends up covered.
-cat > "$dir/coverage/kcov-bin1/cobertura.xml" <<'EOF'
-<?xml version="1.0"?>
-<coverage line-rate="0.5"><packages><package name="bin"><classes>
-<class name="deploy.sh" filename="/src/bin/deploy.sh"><lines>
-<line number="1" hits="1"/><line number="2" hits="0"/><line number="3" hits="1"/>
-<line number="10" hits="0"/><line number="11" hits="0"/>
-</lines></class></classes></package></packages></coverage>
+# bin/deploy.sh: lines 2-11 are coverable (line 1 is the shebang, a
+# comment); the trace below hits 2, 4, 6, 8, 10 — 5 of 10 => 50.0%.
+cat > "$dir/bin/deploy.sh" <<'EOF'
+#!/usr/bin/env bash
+echo one
+echo two
+echo three
+echo four
+echo five
+echo six
+echo seven
+echo eight
+echo nine
+echo ten
 EOF
-cat > "$dir/coverage/kcov-bin2/cobertura.xml" <<'EOF'
-<?xml version="1.0"?>
-<coverage line-rate="0.5"><packages><package name="bin"><classes>
-<class name="deploy.sh" filename="/src/bin/deploy.sh"><lines>
-<line number="1" hits="0"/><line number="2" hits="0"/><line number="3" hits="0"/>
-<line number="10" hits="1"/><line number="11" hits="0"/>
-</lines></class></classes></package></packages></coverage>
+
+# One line written with a doubled "+" to cover the nesting-depth case
+# bash's xtrace produces for a nested function/subshell call.
+cat > "$dir/coverage/trace.log" <<EOF
++trace:$dir/bin/deploy.sh:2:echo one
++trace:$dir/bin/deploy.sh:4:echo three
+++trace:$dir/bin/deploy.sh:6:echo five
++trace:$dir/bin/deploy.sh:8:echo seven
++trace:$dir/bin/deploy.sh:10:echo nine
 EOF
-# 5 tracked lines, 3 covered (1, 3, 10) => 60.0% total.
 
 cat > "$dir/diff-fail.txt" <<'EOF'
 diff --git a/bin/deploy.sh b/bin/deploy.sh
@@ -70,7 +78,7 @@ run_check() {
 
 out="$(run_check --diff-file "$dir/diff-fail.txt" --min-changed 90)"
 ec=$?
-assert_contains "$out" "total=60.0%" "coverage: total line coverage computed across merged reports"
+assert_contains "$out" "total=50.0%" "coverage: total line coverage computed from the trace file"
 assert_contains "$out" "changed=50.0% (1/2)" "coverage: changed-line coverage counts only the two added lines"
 assert_exit 1 "$ec" "coverage: exits 1 when changed coverage is below --min-changed"
 assert_contains "$(cat "$dir/coverage/summary.json")" '"changed": 50.0' "coverage: summary.json records the changed percentage"
@@ -87,12 +95,29 @@ assert_exit 0 "$ec" "coverage: zero changed coverable lines passes regardless of
 
 out="$(run_check)"
 ec=$?
-assert_contains "$out" "total=60.0%" "coverage: total is still reported with no --base or --diff-file"
+assert_contains "$out" "total=50.0%" "coverage: total is still reported with no --base or --diff-file"
 assert_contains "$out" "changed=n/a" "coverage: changed-lines bar is skipped with no --base or --diff-file"
 assert_exit 0 "$ec" "coverage: no --min-changed given never fails the run"
 assert_contains "$(cat "$dir/coverage/summary.json")" '"changed": null' "coverage: summary.json changed is null when skipped"
 
 help_out="$(python3 "$SCRIPT" --help 2>&1)"
 assert_contains "$help_out" "usage" "coverage: --help prints usage"
+
+# --- end-to-end: a real traced run of one small test file, through the
+# real tests/run.sh + scripts/ci/trace.sh, no fixture trace file ---
+e2e_dir="$(new_tmpdir)"
+mkdir -p "$e2e_dir/bin" "$e2e_dir/tests" "$e2e_dir/scripts/ci" "$e2e_dir/coverage"
+cp "$REPO_ROOT/bin/job-started-gate.sh" "$e2e_dir/bin/"
+cp "$REPO_ROOT/tests/lib.sh" "$REPO_ROOT/tests/gate.test.sh" "$REPO_ROOT/tests/run.sh" "$e2e_dir/tests/"
+cp "$REPO_ROOT/scripts/ci/trace.sh" "$SCRIPT" "$e2e_dir/scripts/ci/"
+
+e2e_run_out="$(cd "$e2e_dir" && GANGPLANK_TRACE_FILE="$e2e_dir/coverage/trace.log" bash tests/run.sh 2>&1)"
+e2e_run_ec=$?
+assert_exit 0 "$e2e_run_ec" "end-to-end: gate.test.sh still passes while traced"
+
+# bin/ holds only job-started-gate.sh here, so the overall total is that
+# file's own coverage.
+e2e_check_out="$(cd "$e2e_dir" && python3 scripts/ci/coverage-check.py --trace coverage/trace.log)"
+assert_not_contains "$e2e_check_out" "total=0.0%" "end-to-end: a real traced gate.test.sh run yields non-zero bin/job-started-gate.sh coverage"
 
 test_summary_and_exit
