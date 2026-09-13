@@ -72,9 +72,10 @@ push_commit_from_dev() {
 run_deploy() {
   # args after HOST override: any GANGPLANK_* env assignments as KEY=VALUE
   local out err ec
-  local log lockdir ghoutput
+  local log lockdir ghoutput statedir
   log="$(mktemp)"
   lockdir="$(new_tmpdir)"
+  statedir="$(new_tmpdir)/state"
   ghoutput="$(mktemp)"
   out="$(mktemp)"; err="$(mktemp)"
 
@@ -82,10 +83,12 @@ run_deploy() {
     GANGPLANK_REPO="$HOST" \
     GANGPLANK_LOG="$log" \
     GANGPLANK_LOCK_DIR="$lockdir/lock" \
+    GANGPLANK_STATE_DIR="$statedir" \
     GITHUB_OUTPUT="$ghoutput" \
     "$@" \
     bash "$DEPLOY_SCRIPT" ) >"$out" 2>"$err"
   ec=$?
+  DEPLOY_STATE_DIR="$statedir"
 
   DEPLOY_STDOUT="$(cat "$out")"
   DEPLOY_STDERR="$(cat "$err")"
@@ -611,6 +614,185 @@ if [ -d "$wt_dirty" ]; then
 else
   fail "prune locked+dirty: dirty worktree left in place (was removed)"
 fi
+
+# ============================================================================
+# Parking: decide before touching the tree, park only when a pull is coming
+# ============================================================================
+
+# --- dirty tree but nothing to pull: parking is skipped entirely ---
+new_fixture
+echo "local edit, nothing to pull" >> "$HOST/README.md"
+before_dirty_content="$(cat "$HOST/README.md")"
+run_deploy env
+assert_exit 0 "$DEPLOY_EXIT" "dirty+up-to-date: exits 0"
+assert_contains "$DEPLOY_LOG" "up to date" "dirty+up-to-date: log says up to date"
+assert_not_contains "$DEPLOY_LOG" "PARKED" "dirty+up-to-date: no PARKED line"
+after_dirty_content="$(cat "$HOST/README.md")"
+assert_eq "$before_dirty_content" "$after_dirty_content" "dirty+up-to-date: file left untouched"
+stash_list_uptodate="$(git -C "$HOST" stash list)"
+assert_empty "$stash_list_uptodate" "dirty+up-to-date: no stash created"
+
+# --- dirty tree and diverged: refused, edit stays in the tree, no stash ---
+new_fixture
+push_commit_from_dev "diverged-origin commit"
+(
+  cd "$HOST" || exit 1
+  echo "host only commit" >> README.md
+  git add README.md
+  git commit -q -m "host-only commit for diverged+dirty"
+)
+echo "uncommitted local edit" >> "$HOST/README.md"
+before_diverged_dirty_head="$(git -C "$HOST" rev-parse HEAD)"
+run_deploy env
+assert_exit 4 "$DEPLOY_EXIT" "dirty+diverged: exits 4"
+after_diverged_dirty_head="$(git -C "$HOST" rev-parse HEAD)"
+assert_eq "$before_diverged_dirty_head" "$after_diverged_dirty_head" "dirty+diverged: HEAD unchanged"
+diverged_dirty_readme="$(cat "$HOST/README.md")"
+assert_contains "$diverged_dirty_readme" "uncommitted local edit" "dirty+diverged: edit still in the tree"
+stash_list_diverged="$(git -C "$HOST" stash list)"
+assert_empty "$stash_list_diverged" "dirty+diverged: no stash created"
+
+# --- dirty tree with a pull to do: parked, deployed, on_park hook fires ---
+new_fixture
+push_commit_from_dev "onpark commit"
+echo "local edit before a real pull" >> "$HOST/README.md"
+stub_bin record-on-park '{
+  echo "FILES:$GANGPLANK_PARKED_FILES" >> "$ONPARK_LOG"
+  echo "STASH:$GANGPLANK_STASH_NAME" >> "$ONPARK_LOG"
+}'
+onpark_log="$(new_tmpdir)/onpark.log"
+: > "$onpark_log"
+ONPARK_LOG="$onpark_log" run_deploy env GANGPLANK_ON_PARK="record-on-park"
+assert_exit 0 "$DEPLOY_EXIT" "dirty+new commit: exits 0"
+assert_contains "$DEPLOY_LOG" "PARKED 1 file(s): README.md" "dirty+new commit: log names the parked file"
+stash_list_onpark="$(git -C "$HOST" stash list)"
+assert_contains "$stash_list_onpark" "gangplank park" "dirty+new commit: stash present"
+onpark_content="$(cat "$onpark_log" 2>/dev/null)"
+assert_contains "$onpark_content" "FILES:README.md" "dirty+new commit: on_park called with the parked file named"
+assert_contains "$onpark_content" "STASH:gangplank park" "dirty+new commit: on_park called with the stash name"
+
+# --- clean tree with a pull to do: nothing parked, on_park never runs ---
+new_fixture
+push_commit_from_dev "no-park commit"
+stub_bin record-on-park-2 'echo "CALLED" >> "$ONPARK_LOG2"'
+onpark_log2="$(new_tmpdir)/onpark2.log"
+: > "$onpark_log2"
+ONPARK_LOG2="$onpark_log2" run_deploy env GANGPLANK_ON_PARK="record-on-park-2"
+assert_exit 0 "$DEPLOY_EXIT" "clean+new commit: exits 0"
+assert_not_contains "$DEPLOY_LOG" "PARKED" "clean+new commit: no PARKED line"
+onpark2_content="$(cat "$onpark_log2" 2>/dev/null)"
+assert_empty "$onpark2_content" "clean+new commit: on_park never invoked"
+
+# ============================================================================
+# Hook idempotency: resume from the last completed SHA across a crash
+# ============================================================================
+
+# --- marker rewound to the pre-pull SHA: hooks re-run for that range, --
+# --- and the marker is rewritten back to HEAD ---------------------------
+new_fixture
+stub_bin launchctl 'echo "launchctl $*" >> "$LAUNCHCTL_CALLS_LOG"; exit 0'
+resume_calls="$(new_tmpdir)/launchctl-calls.log"
+: > "$resume_calls"
+resume_home="$(new_tmpdir)"
+pre_pull_sha="$(git -C "$HOST" rev-parse HEAD)"
+(
+  cd "$DEV" || exit 1
+  mkdir -p services
+  echo '<plist resume-daemon v1/>' > services/ai.gangplank.resume.plist
+  git add services/ai.gangplank.resume.plist
+  git commit -q -m "add resume daemon plist"
+  git push -q origin main
+)
+LAUNCHCTL_CALLS_LOG="$resume_calls" run_deploy env HOME="$resume_home" GANGPLANK_SERVICES_DIR="services"
+assert_exit 0 "$DEPLOY_EXIT" "hook idempotency: first pull exits 0"
+resume_state_dir="$DEPLOY_STATE_DIR"
+resume_marker="$resume_state_dir/last-hooked-sha"
+post_pull_sha="$(git -C "$HOST" rev-parse HEAD)"
+if [ -f "$resume_marker" ]; then
+  pass "hook idempotency: marker file written after the first pull"
+else
+  fail "hook idempotency: marker file written after the first pull (missing $resume_marker)"
+fi
+assert_eq "$post_pull_sha" "$(cat "$resume_marker" 2>/dev/null)" "hook idempotency: marker matches HEAD after the first pull"
+
+# Rewind the marker to simulate a crash between the fast-forward and its
+# hooks finishing, then run again with nothing new to pull.
+printf '%s\n' "$pre_pull_sha" > "$resume_marker"
+: > "$resume_calls"
+LAUNCHCTL_CALLS_LOG="$resume_calls" run_deploy env HOME="$resume_home" GANGPLANK_SERVICES_DIR="services" GANGPLANK_STATE_DIR="$resume_state_dir"
+assert_exit 0 "$DEPLOY_EXIT" "hook idempotency: resume run exits 0"
+assert_contains "$DEPLOY_LOG" "hooks: resuming from ${pre_pull_sha}" "hook idempotency: log names the resume point"
+resume_calls_content="$(cat "$resume_calls" 2>/dev/null)"
+assert_contains "$resume_calls_content" "bootstrap" "hook idempotency: resumed run re-ran the service hook"
+assert_eq "$post_pull_sha" "$(cat "$resume_marker" 2>/dev/null)" "hook idempotency: marker rewritten to HEAD after the resume"
+
+# --- marker already equals HEAD, up to date: no hook call at all -------
+new_fixture
+stub_bin launchctl 'echo "launchctl $*" >> "$LAUNCHCTL_CALLS_LOG"; exit 0'
+eqhead_calls="$(new_tmpdir)/launchctl-calls.log"
+: > "$eqhead_calls"
+eqhead_home="$(new_tmpdir)"
+(
+  cd "$DEV" || exit 1
+  mkdir -p services
+  echo '<plist eqhead-daemon v1/>' > services/ai.gangplank.eqhead.plist
+  git add services/ai.gangplank.eqhead.plist
+  git commit -q -m "add eqhead daemon plist"
+  git push -q origin main
+)
+LAUNCHCTL_CALLS_LOG="$eqhead_calls" run_deploy env HOME="$eqhead_home" GANGPLANK_SERVICES_DIR="services"
+assert_exit 0 "$DEPLOY_EXIT" "hook idempotency (marker==HEAD): first pull exits 0"
+eqhead_state_dir="$DEPLOY_STATE_DIR"
+eqhead_marker="$eqhead_state_dir/last-hooked-sha"
+head_after_pull="$(git -C "$HOST" rev-parse HEAD)"
+assert_eq "$head_after_pull" "$(cat "$eqhead_marker" 2>/dev/null)" "hook idempotency (marker==HEAD): marker matches HEAD after the pull"
+: > "$eqhead_calls"
+LAUNCHCTL_CALLS_LOG="$eqhead_calls" run_deploy env HOME="$eqhead_home" GANGPLANK_SERVICES_DIR="services" GANGPLANK_STATE_DIR="$eqhead_state_dir"
+assert_exit 0 "$DEPLOY_EXIT" "hook idempotency (marker==HEAD): second run (up to date) exits 0"
+assert_contains "$DEPLOY_LOG" "up to date, nothing to deploy" "hook idempotency (marker==HEAD): log says up to date"
+assert_not_contains "$DEPLOY_LOG" "hooks: resuming" "hook idempotency (marker==HEAD): no resume line"
+eqhead_calls_content="$(cat "$eqhead_calls" 2>/dev/null)"
+assert_empty "$eqhead_calls_content" "hook idempotency (marker==HEAD): no launchctl call on the up-to-date run"
+
+# ============================================================================
+# Services hook: a plist's log directories exist before it is bootstrapped
+# ============================================================================
+
+# --- StandardOutPath/StandardErrorPath point into a not-yet-existing ---
+# --- directory: the services hook creates it before bootstrapping ------
+new_fixture
+stub_bin launchctl 'echo "launchctl $*" >> "$LAUNCHCTL_CALLS_LOG"; exit 0'
+logdirs_home="$(new_tmpdir)"
+not_yet_dir="$(new_tmpdir)/not-yet-created/logs"
+logdir_calls="$(new_tmpdir)/launchctl-calls.log"
+: > "$logdir_calls"
+(
+  cd "$DEV" || exit 1
+  mkdir -p services
+  {
+    echo '<key>StandardOutPath</key>'
+    echo "<string>${not_yet_dir}/out.log</string>"
+    echo '<key>StandardErrorPath</key>'
+    echo "<string>${not_yet_dir}/err.log</string>"
+  } > services/ai.gangplank.logdirs.plist
+  git add services/ai.gangplank.logdirs.plist
+  git commit -q -m "add logdirs plist"
+  git push -q origin main
+)
+if [ -d "$not_yet_dir" ]; then
+  fail "plist log dirs: directory does not exist before the deploy (already present)"
+else
+  pass "plist log dirs: directory does not exist before the deploy"
+fi
+LAUNCHCTL_CALLS_LOG="$logdir_calls" run_deploy env HOME="$logdirs_home" GANGPLANK_SERVICES_DIR="services"
+assert_exit 0 "$DEPLOY_EXIT" "plist log dirs: exits 0"
+if [ -d "$not_yet_dir" ]; then
+  pass "plist log dirs: StandardOutPath/StandardErrorPath directory created before bootstrap"
+else
+  fail "plist log dirs: StandardOutPath/StandardErrorPath directory created before bootstrap (missing $not_yet_dir)"
+fi
+logdir_calls_content="$(cat "$logdir_calls" 2>/dev/null)"
+assert_contains "$logdir_calls_content" "bootstrap" "plist log dirs: launchctl bootstrap still ran"
 
 
 test_summary_and_exit

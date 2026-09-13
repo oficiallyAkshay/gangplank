@@ -65,8 +65,12 @@ inputs:
     description: Command to run once on the first successful deploy after a prior failure. Empty means no alerting.
     required: false
     default: ""
+  on_park:
+    description: Command to run once after a deploy that parks uncommitted edits and then deploys. Empty means no command.
+    required: false
+    default: ""
   state_dir:
-    description: Directory holding the last-failed marker between runs.
+    description: Directory holding the last-failed marker and the hook-idempotency marker between runs.
     required: false
     default: $HOME/.gangplank
 outputs:
@@ -87,11 +91,14 @@ runs:
         GANGPLANK_BRANCH: ${{ inputs.branch }}
         GANGPLANK_LOG: ${{ inputs.log }}
         GANGPLANK_LOCK_DIR: ${{ inputs.lock_dir }}
+        GANGPLANK_STATE_DIR: ${{ inputs.state_dir }}
         GANGPLANK_INSTALL: ${{ inputs.install }}
         GANGPLANK_SERVICES_DIR: ${{ inputs.services_dir }}
         GANGPLANK_KICK: ${{ inputs.kick }}
         GANGPLANK_PRUNE_WORKTREES: ${{ inputs.prune_worktrees }}
         GANGPLANK_SELF_LABEL: ${{ inputs.self_label }}
+        GANGPLANK_ON_PARK: ${{ inputs.on_park }}
+        GANGPLANK_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         GANGPLANK_STDOUT: "1"
         GANGPLANK_TRIGGER: github-actions
         GANGPLANK_ACTION_PATH: ${{ github.action_path }}

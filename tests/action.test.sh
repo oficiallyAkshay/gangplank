@@ -17,13 +17,16 @@ content="$(cat "$ACTION_FILE")"
 
 assert_contains "$content" "using: composite" "action: is a composite action"
 
-for input in repo on_failure on_recovery state_dir; do
+for input in repo on_failure on_recovery on_park state_dir; do
   if printf '%s\n' "$content" | grep -qE "^  ${input}:"; then
     pass "action: input '${input}' present"
   else
     fail "action: input '${input}' present (not found)"
   fi
 done
+
+assert_contains "$content" "GANGPLANK_ON_PARK: \${{ inputs.on_park }}" "action: on_park input mapped to GANGPLANK_ON_PARK env"
+assert_contains "$content" "GANGPLANK_STATE_DIR: \${{ inputs.state_dir }}" "action: state_dir input mapped to GANGPLANK_STATE_DIR env on the deploy step"
 
 # No third-party `uses:` at all — this action never checks anything out
 # and calls no other action.
