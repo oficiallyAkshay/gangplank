@@ -566,9 +566,23 @@ assert_eq "$before_ahead_head" "$after_ahead_head" "ahead only: HEAD unchanged"
 assert_eq "false" "$(gh_output_value deployed)" "ahead only: deployed=false"
 
 # --- worktree prune: gh missing from PATH skips the whole step ---
+# GitHub's own ubuntu-latest runners ship gh on the default PATH, so a
+# hardcoded low-level dir list (e.g. /usr/bin:/bin) is not a reliable way
+# to make gh absent there — it only worked on this Mac because gh isn't
+# under those two dirs locally. Build the "no gh" condition explicitly
+# instead: a PATH containing symlinks for only the binaries bin/deploy.sh
+# itself calls (bash, to exec the script under the restricted PATH, plus
+# every external command the script shells out to), skipping any that
+# aren't present on this host, and never gh.
+no_gh_bindir="$(new_tmpdir)/no-gh-bin"
+mkdir -p "$no_gh_bindir"
+for tool in bash git date mkdir rm cat grep sed sort tr basename dirname id sleep kill printf cp stat; do
+  tool_path="$(command -v "$tool" 2>/dev/null || true)"
+  [ -n "$tool_path" ] && ln -s "$tool_path" "$no_gh_bindir/$tool"
+done
+no_gh_path="$no_gh_bindir"
 new_fixture
 push_commit_from_dev "prune-no-gh commit"
-no_gh_path="/usr/bin:/bin"
 run_deploy env PATH="$no_gh_path"
 assert_exit 0 "$DEPLOY_EXIT" "prune without gh: exits 0"
 assert_contains "$DEPLOY_LOG" "worktree prune SKIPPED — gh not on PATH" "prune without gh: log names the skip"
