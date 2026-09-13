@@ -3,7 +3,8 @@
 # check   shellcheck + actionlint (if present) + tests
 # test    tests/run.sh alone
 # lint    shellcheck + actionlint (if present), no tests
-# coverage  tests/run.sh under kcov (if present), else prints how to get it
+# coverage  tests/run.sh under kcov + scripts/ci/coverage-check.py (if
+#           kcov present), else prints how to get it
 
 SHELL := /bin/bash
 
@@ -39,6 +40,7 @@ coverage:
 	@if command -v kcov >/dev/null 2>&1; then \
 		mkdir -p coverage; \
 		kcov --include-path=bin coverage tests/run.sh; \
+		python3 scripts/ci/coverage-check.py; \
 	else \
 		echo "kcov not found. Install it to measure coverage locally:"; \
 		echo "  macOS:  brew install kcov"; \
