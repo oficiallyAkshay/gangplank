@@ -1087,6 +1087,56 @@ else
   fail "plutil present: StandardErrorPath dir created from the plutil stub's value (missing $plutilok_err_dir)"
 fi
 
+# --- plutil present but fails, printing its error on STDOUT (macOS 14
+# --- shape): the error text is not taken as a path; grep fallback wins --
+new_fixture
+stub_bin launchctl 'echo "launchctl $*" >> "$LAUNCHCTL_CALLS_LOG"; exit 0'
+plutilerr_home="$(new_tmpdir)"
+plutilerr_dir="$(new_tmpdir)/plutil-error-fallback-logs"
+plutilerr_seen="$(new_tmpdir)/plutil-error-seen"
+stub_bin plutil '
+  echo "seen" >> "$PLUTILERR_SEEN"
+  # macOS 14 prints this on stdout, not stderr, and exits 1.
+  echo "$6: Could not extract value, error: No value at that key path or invalid key path: $2"
+  exit 1
+'
+plutilerr_calls="$(new_tmpdir)/launchctl-calls.log"
+: > "$plutilerr_calls"
+(
+  cd "$DEV" || exit 1
+  mkdir -p services
+  {
+    echo '<key>StandardOutPath</key>'
+    echo "<string>${plutilerr_dir}/out.log</string>"
+    echo '<key>StandardErrorPath</key>'
+    echo "<string>${plutilerr_dir}/err.log</string>"
+  } > services/ai.gangplank.plutilerr.plist
+  git add services/ai.gangplank.plutilerr.plist
+  git commit -q -m "add plutilerr plist"
+  git push -q origin main
+)
+LAUNCHCTL_CALLS_LOG="$plutilerr_calls" PLUTILERR_SEEN="$plutilerr_seen" \
+  run_deploy env HOME="$plutilerr_home" GANGPLANK_SERVICES_DIR="services"
+assert_exit 0 "$DEPLOY_EXIT" "plutil fails on stdout: exits 0"
+if [ -s "$plutilerr_seen" ]; then
+  pass "plutil fails on stdout: the plutil stub was actually consulted"
+else
+  fail "plutil fails on stdout: the plutil stub was actually consulted"
+fi
+if [ -d "$plutilerr_dir" ]; then
+  pass "plutil fails on stdout: grep fallback created the log dir"
+else
+  fail "plutil fails on stdout: grep fallback created the log dir (missing $plutilerr_dir)"
+fi
+if [ -d "$DEV/services/ai.gangplank.plutilerr.plist: Could not extract value, error: No value at that key path or invalid key path: StandardOutPath" ] \
+   || ls -d "$DEV"/services/*"Could not extract"* >/dev/null 2>&1; then
+  fail "plutil fails on stdout: no directory was created from the error text"
+else
+  pass "plutil fails on stdout: no directory was created from the error text"
+fi
+plutilerr_calls_content="$(cat "$plutilerr_calls" 2>/dev/null)"
+assert_contains "$plutilerr_calls_content" "bootstrap" "plutil fails on stdout: launchctl bootstrap still ran"
+
 # --- plutil absent (hidden from PATH): grep fallback extracts the value -
 # NOTE: this test builds its own restricted PATH via bindir_without, so it
 # writes its own launchctl stub straight into that dir rather than using

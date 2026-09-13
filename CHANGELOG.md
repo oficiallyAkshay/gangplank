@@ -2,6 +2,8 @@
 
 One line per merged change, newest first. No version numbers here.
 
+- The coverage badge reads the published number through the badge service (the old link pointed one folder too high and never rendered), and the zero-is-good badges carry a colour each instead of one grey.
+- A plist whose log path plutil cannot read gets its log folder from the fallback reader on macOS 14 too; plutil there prints its error on stdout, and only its exit status is trusted now.
 - A stale lock with no pid file is aged correctly on Linux too; the old stat call read the mount point there and aborted the deploy.
 - Tests for every parking, restore, resume and log-dir path in deploy.sh; the coverage checker's --list-uncovered prints the changed lines a PR still misses.
 - The code: gate, deploy step as a composite action, installer, CLI, tests, CI and coverage config.
