@@ -2,11 +2,13 @@
 
 Hands-off, reliable deploys to the Mac that runs your agents. Merge it, and your machine is running it.
 
-![inbound ports](https://img.shields.io/badge/inbound%20ports-0-1f6f78) ![secrets to rotate](https://img.shields.io/badge/secrets%20to%20rotate-0-1f6f78) ![platform](https://img.shields.io/badge/platform-macOS%20%C2%B7%20launchd-555) ![license](https://img.shields.io/badge/license-MIT-555)
+![inbound ports](https://img.shields.io/badge/inbound%20ports-0-1f6f78) ![secrets to rotate](https://img.shields.io/badge/secrets%20to%20rotate-0-1f6f78) ![platform](https://img.shields.io/badge/platform-macOS%20%C2%B7%20launchd-555) ![shellcheck](https://img.shields.io/badge/shellcheck-clean-1f6f78) ![runtime dependencies](https://img.shields.io/badge/runtime%20dependencies-0-1f6f78) ![license](https://img.shields.io/badge/license-MIT-555)
 
 gangplank turns a GitHub self-hosted runner into a deploy-only agent for one Mac. A merge to main lands on the machine in seconds, through one door, never by force. No open port, no tunnel, no secret to rotate.
 
 Built for machines that run long-lived things: OpenClaw, Claude Code loops, daemons, dashboards.
+
+It is made for the way that machine actually gets developed: some changes arrive as merged PRs from wherever you are, and some you make by hand sitting at the box. gangplank keeps both true at once. Your on-box edits are never overwritten by a deploy, and a deploy never waits for you to clean them up.
 
 ## What gangplank adds
 
