@@ -22,7 +22,7 @@ The runner and git do the transport. gangplank adds what neither does:
 - **Daemons ship with their code.** A new or changed launchd definition is loaded on the deploy that carries it; one renamed to disabled is unloaded.
 - **Restarts launchd would drop.** Rapid file changes get coalesced into one event and one daemon loses; gangplank kicks it explicitly.
 - **Parallel-session cleanup that cannot delete live work.** A worktree goes only when its PR merged, its tree is clean, and no session holds it.
-- **Failure-only alerting.** One Slack message when a deploy fails, resolved when the next one succeeds. Nothing on success.
+- **Failure-only alerting, to whatever you point it at.** On a failed deploy it runs the command you name, once; on the first real deploy after that it runs your recovery command. Nothing on success, and nothing at all if you name no command; the red run on GitHub is the record.
 
 ## How it sits
 
@@ -43,7 +43,7 @@ flowchart LR
     H --> S[launchd daemons]
   end
   Q -.->|outbound long-poll<br/>no inbound port| R
-  D -->|only on failure| SL[Slack]
+  D -->|only on failure| SL[Your alert command]
 ```
 
 ## One deploy
@@ -69,8 +69,8 @@ flowchart TD
   I --> J[Kick the daemon launchd would coalesce]
   J --> K[Prune worktrees whose PR merged]
   K --> L{Any hook failed?}
-  L -- yes --> L1[Red. One Slack message]
-  L -- no --> M[Green. Resolve any open failure thread]
+  L -- yes --> L1[Red. Your alert command runs once]
+  L -- no --> M[Green. Your recovery command runs if a failure preceded it]
 ```
 
 ## License

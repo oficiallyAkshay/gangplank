@@ -34,7 +34,7 @@ The macOS job is the only one that touches launchd, and only in dry-run. Nothing
 | Deploy script | fast-forward, diverged, dirty tree parked, stranded branch healed, hook failure exits non-zero after the remaining hooks run, second run waits on the lock |
 | Hooks | install only where a manifest changed; load a new daemon definition; unload one renamed to disabled; the runner's own definition is never reloaded from inside a deploy |
 | Installer | dry-run creates nothing and prints every action with the token redacted; checksum mismatch refuses; verify step fails when the gate on disk differs from the repo copy |
-| Workflow | the queue never cancels a running deploy; the failure step posts once; the success step resolves only after a real pull |
+| Workflow | the queue never cancels a running deploy; the failure command runs once; the recovery command runs only after a real pull |
 
 ## Rules that keep it small
 
