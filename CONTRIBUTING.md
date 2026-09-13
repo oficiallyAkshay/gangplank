@@ -21,7 +21,7 @@ Every check runs in parallel on each PR; a typical run finishes in under two min
 | shellcheck, `--severity=error`, every script | Linux | yes |
 | actionlint, every workflow file | Linux | yes |
 | tests: gate, deploy script, installer dry-run, workflow shape | Linux and macOS | yes |
-| coverage: kcov over the test run, changed lines at or above 90 percent, badge published to the badges branch on main | Linux | yes |
+| coverage: bash line tracing over the test run, changed lines at or above 90 percent, badge published on main | Linux | yes |
 | plist lint for the launchd definition | macOS | yes |
 
 The macOS job is the only one that touches launchd, and only in dry-run. Nothing in CI registers a runner or talks to a real repo.

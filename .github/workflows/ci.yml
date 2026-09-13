@@ -26,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - run: shellcheck --severity=error bin/* examples/*.sh tests/*.sh
+      - run: shellcheck --severity=error bin/* examples/*.sh tests/*.sh scripts/ci/*.sh
 
   actionlint:
     runs-on: ubuntu-latest
@@ -73,43 +73,25 @@ jobs:
     concurrency:
       group: gangplank-coverage-badge-${{ github.ref }}
       cancel-in-progress: false
-    env:
-      # kcov/kcov, tag "latest", pinned by manifest-list digest (checked
-      # 2026-09-13 via the registry's Docker-Content-Digest header).
-      # `apt-get install kcov` has no installable package on
-      # ubuntu-latest (removed from the Ubuntu archive) — running the
-      # published image is the documented way to get kcov on
-      # GitHub-hosted runners.
-      KCOV_IMAGE: kcov/kcov@sha256:481289ae32e55e5b733019515acd10948a4f76dfed381765577db909664fc603
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history: the changed-lines bar on a PR diffs against
           # origin/<base_ref>, which needs that branch's history too.
           fetch-depth: 0
-      - name: Run tests under kcov (Docker image; no apt package on ubuntu-latest)
+      - name: Run tests under bash's own tracing
         run: |
           set -euo pipefail
           mkdir -p coverage
-          # --cap-add=SYS_PTRACE + seccomp=unconfined: kcov traces bash
-          # via ptrace and needs both relaxed on a default-hardened
-          # runner. --bash-parse-files-in-dir makes kcov additionally
-          # parse (and therefore count) the scripts under bin/ that
-          # tests/run.sh's subprocesses exec, not just the tests/run.sh
-          # process kcov directly wraps. git/curl/perl (for `shasum`)
-          # are installed inside the container because the upstream
-          # kcov/kcov image is a minimal Debian base without them, and
-          # the test suite's deploy/installer tests call the real
-          # binaries rather than a stub.
-          docker run --rm             --cap-add=SYS_PTRACE --security-opt seccomp=unconfined             -v "$PWD":/src -w /src             "${KCOV_IMAGE}"             bash -c 'apt-get update -qq && apt-get install -y -qq git curl perl >/dev/null && kcov --include-path=/src/bin --bash-parse-files-in-dir=/src/bin /src/coverage bash /src/tests/run.sh'
+          GANGPLANK_TRACE_FILE="$PWD/coverage/trace.log" bash tests/run.sh
       - name: Coverage gate
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            python3 scripts/ci/coverage-check.py \
+            python3 scripts/ci/coverage-check.py --trace coverage/trace.log \
               --base "origin/${{ github.base_ref || 'main' }}" --min-changed 90
           else
-            python3 scripts/ci/coverage-check.py
+            python3 scripts/ci/coverage-check.py --trace coverage/trace.log
           fi
       - name: Publish badge
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

@@ -34,9 +34,15 @@ GATE_EXIT=""
 
 run_gate_env() {
   # args: any number of "KEY=VALUE" pairs, passed through env -i.
+  # BASH_ENV/GANGPLANK_TRACE_FILE are forwarded too (when set) so a
+  # traced run still traces the gate script through this clean-env
+  # wrapper — they're plumbing for the test run, not gate inputs.
   local out err ec
+  local trace_args=()
+  [ -n "${BASH_ENV:-}" ] && trace_args+=("BASH_ENV=$BASH_ENV")
+  [ -n "${GANGPLANK_TRACE_FILE:-}" ] && trace_args+=("GANGPLANK_TRACE_FILE=$GANGPLANK_TRACE_FILE")
   out="$(mktemp)"; err="$(mktemp)"
-  if env -i PATH="$PATH" "$@" bash "$GATE_SCRIPT" >"$out" 2>"$err"; then
+  if env -i PATH="$PATH" "${trace_args[@]}" "$@" bash "$GATE_SCRIPT" >"$out" 2>"$err"; then
     ec=0
   else
     ec=$?
