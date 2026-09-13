@@ -9,18 +9,31 @@
 #   GANGPLANK_BRANCH          default main. Branch to track and fast-forward to.
 #   GANGPLANK_LOG             default $HOME/.gangplank/deploy.log
 #   GANGPLANK_LOCK_DIR        default $HOME/.gangplank/lock
+#   GANGPLANK_STATE_DIR       default $HOME/.gangplank. Holds last-hooked-sha,
+#                             the SHA whose hooks + prune last finished (see
+#                             "Hook idempotency" below).
 #   GANGPLANK_INSTALL         newline "glob=command" pairs; command runs in the
 #                             directory of each changed file whose basename
 #                             matches glob. Default: package.json and
 #                             package-lock.json => npm install --no-audit
 #                             --no-fund. Literal "none" disables.
 #   GANGPLANK_SERVICES_DIR    repo-relative folder of launchd plists; unset
-#                             skips daemon load/unload entirely.
+#                             skips daemon load/unload entirely. Before a
+#                             plist is bootstrapped its StandardOutPath and
+#                             StandardErrorPath directories are created.
 #   GANGPLANK_KICK            space-separated launchd labels to kickstart -k
 #                             after any pull that moved HEAD; unset skips.
 #   GANGPLANK_PRUNE_WORKTREES true (default) or false.
 #   GANGPLANK_SELF_LABEL      default gangplank.runner. A plist named for this
 #                             label is never loaded/unloaded from in here.
+#   GANGPLANK_ON_PARK         command run once, after a deploy that parked
+#                             edits and then actually fast-forwarded. Gets
+#                             GANGPLANK_PARKED_FILES (newline list),
+#                             GANGPLANK_STASH_NAME, and GANGPLANK_RUN_URL
+#                             (copied from this script's own env if set,
+#                             else empty). Unset means no command.
+#   GANGPLANK_RUN_URL         optional; not used directly, only forwarded to
+#                             GANGPLANK_ON_PARK when it runs.
 #   GANGPLANK_TRIGGER         default manual. Logged only.
 #   GANGPLANK_STDOUT          "1" mirrors every log line to stdout too.
 #   GANGPLANK_DEBUG           "1" logs every decision, one line each.
@@ -29,12 +42,25 @@
 #
 # Exit codes: 0 up to date or deployed clean; 2 a hook failed (every other
 # hook and the prune still ran first); 3 lock held by a live owner past
-# 600s; 4 refused — diverged, or a fast-forward that should have worked
-# didn't; 5 fetch failed; 64 bad configuration.
+# 600s; 4 refused — diverged, a fast-forward that should have worked
+# didn't (parked edits, if any, are popped straight back first), or the
+# stash push itself failed; 5 fetch failed; 64 bad configuration.
 #
-# Safety: never force-pushes or resets. A dirty tree is stashed away (never
-# restored by this script — recover it yourself with the git stash command)
-# so a deploy never clobbers or blocks on an on-box edit.
+# Safety: never force-pushes or resets. The working tree is left alone
+# until we already know a fast-forward is about to happen — up to date,
+# diverged, and a failed fetch never touch it. Only then, if the tree is
+# dirty, is it stashed (never re-applied by this script — recover it
+# yourself with the git stash command) — unless that fast-forward then
+# fails, in which case the stash is popped straight back and nothing was
+# deployed.
+#
+# Hook idempotency: the SHA whose hooks (install/services) and prune last
+# finished running is kept at GANGPLANK_STATE_DIR/last-hooked-sha, written
+# only once they all finish. When that marker is present and does not
+# match current HEAD — even on a run that pulls nothing new — hooks run
+# again for <marker>..HEAD instead of being skipped, so a crash between a
+# fast-forward and its hooks finishing is caught up next run rather than
+# silently skipped forever.
 
 set -uo pipefail
 
@@ -75,6 +101,13 @@ GANGPLANK_SELF_LABEL="${GANGPLANK_SELF_LABEL:-gangplank.runner}"
 GANGPLANK_PRUNE_WORKTREES="${GANGPLANK_PRUNE_WORKTREES:-true}"
 BRANCH="${GANGPLANK_BRANCH:-main}"
 
+GANGPLANK_STATE_DIR="${GANGPLANK_STATE_DIR:-${HOME}/.gangplank}"
+HOOK_MARKER_FILE="${GANGPLANK_STATE_DIR}/last-hooked-sha"
+LAST_HOOKED_SHA=""
+if [ -f "${HOOK_MARKER_FILE}" ]; then
+  LAST_HOOKED_SHA="$(tr -d '[:space:]' < "${HOOK_MARKER_FILE}" 2>/dev/null || true)"
+fi
+
 write_output() {
   local deployed="$1" commits="$2"
   if [ -n "${GITHUB_OUTPUT:-}" ]; then
@@ -85,133 +118,26 @@ write_output() {
   fi
 }
 
-# --- Cross-process lock ----------------------------------------------------
-# mkdir is atomic even across processes, so its success/failure IS the lock.
-# A held lock survives a SIGKILL or power loss with nothing left to release
-# it, so a pid is written on acquisition: while waiting, a lock whose owner
-# pid no longer exists (or whose dir predates any pid file by more than the
-# 600s cap when no pid file was ever written) is stale, removed, and retried
-# immediately rather than counted against the wait budget. A LIVE owner
-# still makes us wait out the full 600s cap before we give up.
-LOCK_PID_FILE="${LOCK_DIR}/pid"
-LOCK_ACQUIRED=0
-LOCK_WAITED=0
-until mkdir "${LOCK_DIR}" 2>/dev/null; do
-  if [ -f "${LOCK_PID_FILE}" ]; then
-    owner_pid="$(cat "${LOCK_PID_FILE}" 2>/dev/null || true)"
-    if [ -n "${owner_pid}" ] && ! kill -0 "${owner_pid}" 2>/dev/null; then
-      log "stale lock from pid ${owner_pid} removed"
-      rm -rf "${LOCK_DIR}" 2>/dev/null || true
-      continue
-    fi
-  elif [ -e "${LOCK_DIR}" ]; then
-    lock_mtime="$(stat -f %m "${LOCK_DIR}" 2>/dev/null || stat -c %Y "${LOCK_DIR}" 2>/dev/null || echo "")"
-    if [ -n "${lock_mtime}" ] && [ $(( $(date +%s) - lock_mtime )) -ge 600 ]; then
-      log "stale lock with no pid file removed"
-      rm -rf "${LOCK_DIR}" 2>/dev/null || true
-      continue
-    fi
-  fi
-  if [ "${LOCK_WAITED}" -ge 600 ]; then
-    log "another deploy has held the lock for 10 minutes — refusing"
-    exit 3
-  fi
-  sleep 5
-  LOCK_WAITED=$((LOCK_WAITED + 5))
-done
-LOCK_ACQUIRED=1
-echo "$$" > "${LOCK_PID_FILE}"
-[ "${LOCK_WAITED}" -gt 0 ] && log "lock waited ${LOCK_WAITED}s"
-debug "lock acquired at ${LOCK_DIR}"
+# --- Hook + prune helpers ---------------------------------------------
+# Defined ahead of the lock/fetch/compare flow below because both the
+# "up to date but hooks never finished" path and the normal "behind, pull
+# it" path call into these.
 
-release_lock() {
-  if [ "${LOCK_ACQUIRED:-0}" -eq 1 ]; then
-    rm -rf "${LOCK_DIR}" 2>/dev/null || true
+HOOK_FAILED=0
+
+# write_marker SHA — records the SHA whose hooks + prune just finished,
+# via a temp-file-then-rename so a crash mid-write never leaves a
+# half-written marker that would be read back as a valid (wrong) SHA.
+write_marker() {
+  local sha="$1"
+  mkdir -p "${GANGPLANK_STATE_DIR}" 2>/dev/null || true
+  if printf '%s\n' "${sha}" > "${HOOK_MARKER_FILE}.tmp" 2>/dev/null \
+     && mv -f "${HOOK_MARKER_FILE}.tmp" "${HOOK_MARKER_FILE}" 2>/dev/null; then
+    debug "hook marker: recorded ${sha}"
+  else
+    log "hook marker: failed to write ${HOOK_MARKER_FILE}"
   fi
 }
-trap release_lock EXIT
-
-cd "${REPO}" || { log "FATAL: cannot cd to ${REPO}"; exit 64; }
-
-# --- Dirty tree: park it, never restore it automatically -------------------
-# An on-box edit must never be clobbered by a deploy and must never block
-# one either. Stash everything (including untracked, so the tree is clean
-# for the fast-forward) and continue. This script never restores that stash
-# on its own — recover it yourself with the git stash command when ready.
-PARKED_COUNT=0
-if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
-  PARKED_FILES=$(git status --porcelain 2>/dev/null)
-  PARKED_COUNT=$(printf '%s\n' "${PARKED_FILES}" | grep -c .)
-  STASH_MSG="gangplank park $(ts)"
-  if git stash push --include-untracked -m "${STASH_MSG}" >> "${LOG}" 2>&1; then
-    PARKED_SHA=$(git rev-parse --short "stash@{0}" 2>/dev/null || echo "?")
-    log "PARKED ${PARKED_COUNT} file(s) — stash=${PARKED_SHA} msg=\"${STASH_MSG}\" (left in the stash; this script never restores it)"
-  else
-    log "PARK FAILED: git stash push failed — deploy blocked, needs a hand on the box"
-    write_output false 0
-    exit 4
-  fi
-else
-  debug "working tree clean, nothing to park"
-fi
-
-# --- Fetch -------------------------------------------------------------
-if ! git fetch --prune origin --quiet 2>> "${LOG}"; then
-  log "FETCH FAILED: git fetch --prune origin"
-  write_output false 0
-  exit 5
-fi
-debug "fetch --prune origin OK"
-
-# --- Self-heal: checkout stranded on a squash-merged branch -----------
-# A worktree left on a feature branch whose PR has since squash-merged has
-# no origin/<branch> ref left (branch deleted on merge) and a HEAD that has
-# diverged from origin/${BRANCH} — ff-only would refuse forever. Detected
-# here because the park above already guarantees a clean tree to switch out of.
-CURRENT_BRANCH=$(git symbolic-ref --short -q HEAD || echo "")
-if [ -n "${CURRENT_BRANCH}" ] && [ "${CURRENT_BRANCH}" != "${BRANCH}" ]; then
-  if ! git rev-parse --verify --quiet "refs/remotes/origin/${CURRENT_BRANCH}" >/dev/null 2>&1; then
-    log "SELF-HEAL: HEAD on ${CURRENT_BRANCH} (origin ref gone, likely squash-merged) — switching to ${BRANCH}"
-    if git checkout "${BRANCH}" >> "${LOG}" 2>&1; then
-      if git branch -D "${CURRENT_BRANCH}" >> "${LOG}" 2>&1; then
-        log "SELF-HEAL: deleted stale local branch ${CURRENT_BRANCH}"
-      else
-        log "SELF-HEAL: kept stale local branch ${CURRENT_BRANCH} (delete failed, non-fatal)"
-      fi
-    else
-      log "SELF-HEAL FAILED: could not checkout ${BRANCH} from ${CURRENT_BRANCH}"
-      write_output false 0
-      exit 4
-    fi
-  fi
-fi
-
-# --- Compare: refuse instead of force ----------------------------------
-BEHIND=$(git rev-list --count "HEAD..origin/${BRANCH}" 2>/dev/null || echo "?")
-AHEAD=$(git rev-list --count "origin/${BRANCH}..HEAD" 2>/dev/null || echo "?")
-debug "behind=${BEHIND} ahead=${AHEAD}"
-
-if [ "${BEHIND}" = "0" ] && [ "${AHEAD}" = "0" ]; then
-  log "up to date, nothing to deploy"
-  write_output false 0
-  exit 0
-fi
-
-if [ "${BEHIND}" = "0" ] && [ "${AHEAD}" != "0" ]; then
-  log "AHEAD ${AHEAD} (local has un-pushed commits — not pulling)"
-  write_output false 0
-  exit 0
-fi
-
-if [ "${AHEAD}" != "0" ]; then
-  log "DIVERGED: ahead ${AHEAD}, behind ${BEHIND} of origin/${BRANCH} — fast-forward refused, needs a hand"
-  write_output false 0
-  exit 4
-fi
-
-# --- Behind only: fast-forward, then run hooks on the actual diff ------
-PRE_MERGE_SHA=$(git rev-parse HEAD)
-HOOK_FAILED=0
 
 run_install_hooks() {
   local pre="$1" changed="$2"
@@ -264,6 +190,38 @@ package-lock.json=npm install --no-audit --no-fund"
   done <<< "${seen_combo}"
 }
 
+# extract_plist_value PLIST KEY — prints the string value of KEY inside
+# PLIST. plutil (present on every macOS this targets) does the real
+# extraction; a plain grep of the <string> line right after the <key>
+# line covers a box or CI runner without plutil on PATH, or a plist
+# fragment plutil can't parse as a whole document.
+extract_plist_value() {
+  local plist="$1" key="$2" val=""
+  if command -v plutil >/dev/null 2>&1; then
+    val="$(plutil -extract "${key}" raw -o - "${plist}" 2>/dev/null || true)"
+  fi
+  if [ -z "${val}" ]; then
+    val="$(grep -A1 "<key>${key}</key>" "${plist}" 2>/dev/null \
+      | sed -n 's/.*<string>\(.*\)<\/string>.*/\1/p' \
+      | head -n1)"
+  fi
+  printf '%s' "${val}"
+}
+
+# ensure_plist_log_dirs PLIST — creates the parent directories of a
+# plist's StandardOutPath/StandardErrorPath before it is bootstrapped, so
+# launchd doesn't silently drop a daemon's first output because the
+# directory never existed.
+ensure_plist_log_dirs() {
+  local plist="$1" key val
+  for key in StandardOutPath StandardErrorPath; do
+    val="$(extract_plist_value "${plist}" "${key}")"
+    if [ -n "${val}" ]; then
+      mkdir -p "$(dirname "${val}")" 2>/dev/null || true
+    fi
+  done
+}
+
 run_service_hooks() {
   local pre="$1"
   local dir="${GANGPLANK_SERVICES_DIR:-}"
@@ -297,6 +255,7 @@ run_service_hooks() {
     if [ -f "${src}" ]; then
       log "hook: loading ${fname}"
       launchctl bootout "gui/${uid}/${label}" >> "${LOG}" 2>&1 || true
+      ensure_plist_log_dirs "${src}"
       cp "${src}" "${target_dir}/${fname}"
       if ! launchctl bootstrap "gui/${uid}" "${target_dir}/${fname}" >> "${LOG}" 2>&1; then
         log "hook: launchctl bootstrap FAILED for ${label}"
@@ -375,13 +334,188 @@ prune_worktrees() {
   return 0
 }
 
+# --- Cross-process lock ----------------------------------------------------
+# mkdir is atomic even across processes, so its success/failure IS the lock.
+# A held lock survives a SIGKILL or power loss with nothing left to release
+# it, so a pid is written on acquisition: while waiting, a lock whose owner
+# pid no longer exists (or whose dir predates any pid file by more than the
+# 600s cap when no pid file was ever written) is stale, removed, and retried
+# immediately rather than counted against the wait budget. A LIVE owner
+# still makes us wait out the full 600s cap before we give up.
+LOCK_PID_FILE="${LOCK_DIR}/pid"
+LOCK_ACQUIRED=0
+LOCK_WAITED=0
+until mkdir "${LOCK_DIR}" 2>/dev/null; do
+  if [ -f "${LOCK_PID_FILE}" ]; then
+    owner_pid="$(cat "${LOCK_PID_FILE}" 2>/dev/null || true)"
+    if [ -n "${owner_pid}" ] && ! kill -0 "${owner_pid}" 2>/dev/null; then
+      log "stale lock from pid ${owner_pid} removed"
+      rm -rf "${LOCK_DIR}" 2>/dev/null || true
+      continue
+    fi
+  elif [ -e "${LOCK_DIR}" ]; then
+    lock_mtime="$(stat -f %m "${LOCK_DIR}" 2>/dev/null || stat -c %Y "${LOCK_DIR}" 2>/dev/null || echo "")"
+    if [ -n "${lock_mtime}" ] && [ $(( $(date +%s) - lock_mtime )) -ge 600 ]; then
+      log "stale lock with no pid file removed"
+      rm -rf "${LOCK_DIR}" 2>/dev/null || true
+      continue
+    fi
+  fi
+  if [ "${LOCK_WAITED}" -ge 600 ]; then
+    log "another deploy has held the lock for 10 minutes — refusing"
+    exit 3
+  fi
+  sleep 5
+  LOCK_WAITED=$((LOCK_WAITED + 5))
+done
+LOCK_ACQUIRED=1
+echo "$$" > "${LOCK_PID_FILE}"
+[ "${LOCK_WAITED}" -gt 0 ] && log "lock waited ${LOCK_WAITED}s"
+debug "lock acquired at ${LOCK_DIR}"
+
+release_lock() {
+  if [ "${LOCK_ACQUIRED:-0}" -eq 1 ]; then
+    rm -rf "${LOCK_DIR}" 2>/dev/null || true
+  fi
+}
+trap release_lock EXIT
+
+cd "${REPO}" || { log "FATAL: cannot cd to ${REPO}"; exit 64; }
+
+# --- Fetch -------------------------------------------------------------
+# Nothing above this point touches the working tree, and nothing below it
+# does either until we know — from the compare, right after this — that a
+# fast-forward is actually about to happen.
+if ! git fetch --prune origin --quiet 2>> "${LOG}"; then
+  log "FETCH FAILED: git fetch --prune origin"
+  write_output false 0
+  exit 5
+fi
+debug "fetch --prune origin OK"
+
+# --- Self-heal: checkout stranded on a squash-merged branch -----------
+# A worktree left on a feature branch whose PR has since squash-merged has
+# no origin/<branch> ref left (branch deleted on merge) and a HEAD that has
+# diverged from origin/${BRANCH} — ff-only would refuse forever.
+CURRENT_BRANCH=$(git symbolic-ref --short -q HEAD || echo "")
+if [ -n "${CURRENT_BRANCH}" ] && [ "${CURRENT_BRANCH}" != "${BRANCH}" ]; then
+  if ! git rev-parse --verify --quiet "refs/remotes/origin/${CURRENT_BRANCH}" >/dev/null 2>&1; then
+    log "SELF-HEAL: HEAD on ${CURRENT_BRANCH} (origin ref gone, likely squash-merged) — switching to ${BRANCH}"
+    if git checkout "${BRANCH}" >> "${LOG}" 2>&1; then
+      if git branch -D "${CURRENT_BRANCH}" >> "${LOG}" 2>&1; then
+        log "SELF-HEAL: deleted stale local branch ${CURRENT_BRANCH}"
+      else
+        log "SELF-HEAL: kept stale local branch ${CURRENT_BRANCH} (delete failed, non-fatal)"
+      fi
+    else
+      log "SELF-HEAL FAILED: could not checkout ${BRANCH} from ${CURRENT_BRANCH}"
+      write_output false 0
+      exit 4
+    fi
+  fi
+fi
+
+# --- Compare: decide BEFORE touching anything whether a pull is needed -
+BEHIND=$(git rev-list --count "HEAD..origin/${BRANCH}" 2>/dev/null || echo "?")
+AHEAD=$(git rev-list --count "origin/${BRANCH}..HEAD" 2>/dev/null || echo "?")
+debug "behind=${BEHIND} ahead=${AHEAD}"
+CURRENT_SHA=$(git rev-parse HEAD)
+
+if [ "${BEHIND}" = "0" ] && [ "${AHEAD}" = "0" ]; then
+  # Up to date: no fast-forward, so the working tree is never touched.
+  # But a prior run may have crashed after pulling and before its hooks
+  # (or prune) finished — the marker still names that older SHA, so catch
+  # those hooks up now even though there is nothing new to pull.
+  RESUME_PRE=""
+  if [ -n "${LAST_HOOKED_SHA}" ] && [ "${LAST_HOOKED_SHA}" != "${CURRENT_SHA}" ] \
+     && git rev-parse --verify --quiet "${LAST_HOOKED_SHA}" >/dev/null 2>&1; then
+    RESUME_PRE="${LAST_HOOKED_SHA}"
+  fi
+  if [ -z "${RESUME_PRE}" ]; then
+    log "up to date, nothing to deploy"
+    write_output false 0
+    exit 0
+  fi
+  log "up to date, nothing new to pull — hooks never finished last time"
+  log "hooks: resuming from ${RESUME_PRE}"
+  CHANGED=$(git diff --name-only "${RESUME_PRE}" HEAD 2>>"${LOG}")
+  run_install_hooks "${RESUME_PRE}" "${CHANGED}"
+  run_service_hooks "${RESUME_PRE}"
+  prune_worktrees
+  write_marker "${CURRENT_SHA}"
+  if [ "${HOOK_FAILED}" -eq 1 ]; then
+    log "EXIT 2: a hook failed — see FAILED lines above (every remaining hook and the prune still ran)"
+    write_output false 0
+    exit 2
+  fi
+  write_output false 0
+  exit 0
+fi
+
+if [ "${BEHIND}" = "0" ] && [ "${AHEAD}" != "0" ]; then
+  log "AHEAD ${AHEAD} (local has un-pushed commits — not pulling)"
+  write_output false 0
+  exit 0
+fi
+
+if [ "${AHEAD}" != "0" ]; then
+  log "DIVERGED: ahead ${AHEAD}, behind ${BEHIND} of origin/${BRANCH} — fast-forward refused, needs a hand"
+  write_output false 0
+  exit 4
+fi
+
+# --- Behind only: a fast-forward is happening. Park a dirty tree now, --
+# --- never before this point. --------------------------------------
+PRE_MERGE_SHA="${CURRENT_SHA}"
+PARKED_COUNT=0
+PARKED_FILES=""
+STASH_MSG=""
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  PARKED_FILES="$(git status --porcelain 2>/dev/null | cut -c4-)"
+  PARKED_COUNT=$(printf '%s\n' "${PARKED_FILES}" | grep -c .)
+  STASH_MSG="gangplank park $(ts)"
+  if git stash push --include-untracked -m "${STASH_MSG}" >> "${LOG}" 2>&1; then
+    debug "parked ${PARKED_COUNT} file(s) ahead of the fast-forward — stash=\"${STASH_MSG}\""
+  else
+    log "PARK FAILED: git stash push failed — deploy blocked, needs a hand on the box"
+    write_output false 0
+    exit 4
+  fi
+else
+  debug "working tree clean, nothing to park"
+fi
+
 if git merge --ff-only "origin/${BRANCH}" >> "${LOG}" 2>&1; then
   log "PULLED ${BEHIND} commit(s)"
-  CHANGED=$(git diff --name-only "${PRE_MERGE_SHA}" HEAD 2>>"${LOG}")
-  run_install_hooks "${PRE_MERGE_SHA}" "${CHANGED}"
-  run_service_hooks "${PRE_MERGE_SHA}"
+  NEW_HEAD=$(git rev-parse HEAD)
+
+  HOOK_RANGE_PRE="${PRE_MERGE_SHA}"
+  if [ -n "${LAST_HOOKED_SHA}" ] && [ "${LAST_HOOKED_SHA}" != "${NEW_HEAD}" ] \
+     && git rev-parse --verify --quiet "${LAST_HOOKED_SHA}" >/dev/null 2>&1; then
+    HOOK_RANGE_PRE="${LAST_HOOKED_SHA}"
+    log "hooks: resuming from ${LAST_HOOKED_SHA}"
+  fi
+
+  CHANGED=$(git diff --name-only "${HOOK_RANGE_PRE}" HEAD 2>>"${LOG}")
+  run_install_hooks "${HOOK_RANGE_PRE}" "${CHANGED}"
+  run_service_hooks "${HOOK_RANGE_PRE}"
   run_kick
   prune_worktrees
+  write_marker "${NEW_HEAD}"
+
+  if [ "${PARKED_COUNT}" -gt 0 ]; then
+    names_joined="$(printf '%s' "${PARKED_FILES}" | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')"
+    log "PARKED ${PARKED_COUNT} file(s): ${names_joined} — stash=\"${STASH_MSG}\" (left in the stash; this script never restores it)"
+    if [ -n "${GANGPLANK_ON_PARK:-}" ]; then
+      log "hook: running GANGPLANK_ON_PARK"
+      if ! ( export GANGPLANK_PARKED_FILES="${PARKED_FILES}"
+             export GANGPLANK_STASH_NAME="${STASH_MSG}"
+             export GANGPLANK_RUN_URL="${GANGPLANK_RUN_URL:-}"
+             eval "${GANGPLANK_ON_PARK}" ) >> "${LOG}" 2>&1; then
+        log "hook: GANGPLANK_ON_PARK command failed (non-fatal)"
+      fi
+    fi
+  fi
 
   if [ "${HOOK_FAILED}" -eq 1 ]; then
     log "EXIT 2: a hook failed — see FAILED lines above (every remaining hook and the prune still ran)"
@@ -392,6 +526,13 @@ if git merge --ff-only "origin/${BRANCH}" >> "${LOG}" 2>&1; then
   exit 0
 else
   log "MERGE FAILED despite behind-only check — fast-forward should have worked"
+  if [ "${PARKED_COUNT}" -gt 0 ]; then
+    if git stash pop >> "${LOG}" 2>&1; then
+      log "RESTORED parked edits — no deploy happened"
+    else
+      log "RESTORE FAILED: git stash pop failed — parked edits remain in stash=\"${STASH_MSG}\", needs a hand on the box"
+    fi
+  fi
   write_output false 0
   exit 4
 fi

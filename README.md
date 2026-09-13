@@ -16,7 +16,7 @@ The runner and git do the transport. gangplank adds what neither does:
 
 - **The gate.** The runner will run any job it is handed; the gate refuses all but one named workflow on one named branch, fails closed if it cannot verify, and makes no network calls. That is what makes a self-hosted runner safe on a machine that holds secrets.
 - **Refuse instead of force.** Divergence, a failed fetch, or a tree that cannot fast-forward stops the deploy and says why. Never a reset.
-- **Park, do not re-apply.** Your uncommitted edits on the box are set aside under a named stash and left there. A deploy never edits your working files.
+- **Park, do not re-apply, and only when a pull actually happens; a failed pull puts them back.** Your uncommitted edits on the box are set aside under a named stash and left there. A deploy never edits your working files.
 - **Self-heal from a stranded checkout.** A box left on a branch that has since squash-merged is put back on main and deployed.
 - **Install only what changed.** Dependencies are reinstalled only in the packages whose manifest moved in this deploy.
 - **Daemons ship with their code.** A new or changed launchd definition is loaded on the deploy that carries it; one renamed to disabled is unloaded.
