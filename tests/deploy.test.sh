@@ -291,4 +291,312 @@ assert_contains "$DEPLOY_LOG" "reload it by hand" "self-plist change: log calls 
 calls_content="$(cat "$calls_log" 2>/dev/null || true)"
 assert_not_contains "$calls_content" "ai.gangplank.self" "self-plist change: launchctl never called with the self label"
 
+# --- services hook: a new plist is copied and bootstrapped ---
+new_fixture
+stub_bin launchctl 'echo "launchctl $*" >> "$LAUNCHCTL_CALLS_LOG"; exit 0'
+new_plist_home="$(new_tmpdir)"
+new_plist_calls="$(new_tmpdir)/launchctl-calls.log"
+: > "$new_plist_calls"
+(
+  cd "$DEV" || exit 1
+  mkdir -p services
+  echo '<plist new-daemon v1/>' > services/ai.gangplank.newdaemon.plist
+  git add services/ai.gangplank.newdaemon.plist
+  git commit -q -m "add new daemon plist"
+  git push -q origin main
+)
+LAUNCHCTL_CALLS_LOG="$new_plist_calls" run_deploy env HOME="$new_plist_home" GANGPLANK_SERVICES_DIR="services"
+assert_exit 0 "$DEPLOY_EXIT" "new plist: exits 0"
+installed_new_plist="$new_plist_home/Library/LaunchAgents/ai.gangplank.newdaemon.plist"
+if [ -f "$installed_new_plist" ]; then
+  pass "new plist: copy lands in the fake HOME/Library/LaunchAgents"
+else
+  fail "new plist: copy lands in the fake HOME/Library/LaunchAgents (missing $installed_new_plist)"
+fi
+new_plist_calls_content="$(cat "$new_plist_calls")"
+assert_contains "$new_plist_calls_content" "bootstrap" "new plist: launchctl bootstrap recorded"
+
+# --- services hook: a plist renamed to .plist.disabled is unloaded ---
+new_fixture
+(
+  cd "$DEV" || exit 1
+  mkdir -p services
+  echo '<plist to-disable v1/>' > services/ai.gangplank.tobedisabled.plist
+  git add services/ai.gangplank.tobedisabled.plist
+  git commit -q -m "add tobedisabled plist"
+  git push -q origin main
+)
+( cd "$HOST" || exit 1; git pull -q origin main )
+stub_bin launchctl 'echo "launchctl $*" >> "$LAUNCHCTL_CALLS_LOG"; exit 0'
+disable_calls="$(new_tmpdir)/launchctl-calls.log"
+: > "$disable_calls"
+(
+  cd "$DEV" || exit 1
+  git mv services/ai.gangplank.tobedisabled.plist services/ai.gangplank.tobedisabled.plist.disabled
+  git commit -q -m "disable daemon"
+  git push -q origin main
+)
+LAUNCHCTL_CALLS_LOG="$disable_calls" run_deploy env HOME="$(new_tmpdir)" GANGPLANK_SERVICES_DIR="services"
+assert_exit 0 "$DEPLOY_EXIT" "disabled plist: exits 0"
+assert_contains "$DEPLOY_LOG" "renamed to .disabled" "disabled plist: log calls out the rename"
+disable_calls_content="$(cat "$disable_calls")"
+assert_contains "$disable_calls_content" "bootout" "disabled plist: launchctl bootout recorded"
+assert_contains "$disable_calls_content" "ai.gangplank.tobedisabled" "disabled plist: bootout named the right label"
+
+# --- services hook: a deleted plist is unloaded and its copy removed ---
+new_fixture
+(
+  cd "$DEV" || exit 1
+  mkdir -p services
+  echo '<plist to-delete v1/>' > services/ai.gangplank.todelete.plist
+  git add services/ai.gangplank.todelete.plist
+  git commit -q -m "add todelete plist"
+  git push -q origin main
+)
+( cd "$HOST" || exit 1; git pull -q origin main )
+delete_home="$(new_tmpdir)"
+mkdir -p "$delete_home/Library/LaunchAgents"
+echo '<plist stale copy/>' > "$delete_home/Library/LaunchAgents/ai.gangplank.todelete.plist"
+stub_bin launchctl 'echo "launchctl $*" >> "$LAUNCHCTL_CALLS_LOG"; exit 0'
+delete_calls="$(new_tmpdir)/launchctl-calls.log"
+: > "$delete_calls"
+(
+  cd "$DEV" || exit 1
+  git rm -q services/ai.gangplank.todelete.plist
+  git commit -q -m "remove todelete plist"
+  git push -q origin main
+)
+LAUNCHCTL_CALLS_LOG="$delete_calls" run_deploy env HOME="$delete_home" GANGPLANK_SERVICES_DIR="services"
+assert_exit 0 "$DEPLOY_EXIT" "deleted plist: exits 0"
+assert_contains "$DEPLOY_LOG" "gone (removed or renamed to .disabled) — unloading" "deleted plist: log calls out the removal"
+delete_calls_content="$(cat "$delete_calls")"
+assert_contains "$delete_calls_content" "bootout" "deleted plist: launchctl bootout recorded"
+if [ -f "$delete_home/Library/LaunchAgents/ai.gangplank.todelete.plist" ]; then
+  fail "deleted plist: stale copy removed from LaunchAgents (still present)"
+else
+  pass "deleted plist: stale copy removed from LaunchAgents"
+fi
+
+# --- GANGPLANK_KICK: kickstart called for every named label ---
+new_fixture
+push_commit_from_dev "kick commit"
+stub_bin launchctl 'echo "launchctl $*" >> "$LAUNCHCTL_CALLS_LOG"; exit 0'
+kick_calls="$(new_tmpdir)/launchctl-calls.log"
+: > "$kick_calls"
+LAUNCHCTL_CALLS_LOG="$kick_calls" run_deploy env GANGPLANK_KICK="daemon.one daemon.two"
+assert_exit 0 "$DEPLOY_EXIT" "kick: exits 0"
+kick_calls_content="$(cat "$kick_calls")"
+assert_contains "$kick_calls_content" "kickstart -k gui/" "kick: launchctl kickstart -k invoked"
+assert_contains "$kick_calls_content" "daemon.one" "kick: daemon.one kicked"
+assert_contains "$kick_calls_content" "daemon.two" "kick: daemon.two kicked"
+
+# --- GANGPLANK_INSTALL=none skips every install hook ---
+new_fixture
+(
+  cd "$DEV" || exit 1
+  echo '{"name":"fixture","v":2}' > package.json
+  git add package.json
+  git commit -q -m "bump package.json"
+  git push -q origin main
+)
+run_deploy env GANGPLANK_INSTALL=none GANGPLANK_DEBUG=1
+assert_exit 0 "$DEPLOY_EXIT" "install=none: exits 0"
+assert_contains "$DEPLOY_LOG" "GANGPLANK_INSTALL=none, skipping install hooks" "install=none: log names the skip"
+assert_not_contains "$DEPLOY_LOG" "hook: install in" "install=none: no install hook ran"
+
+# --- custom glob=command pair runs in the changed file's directory ---
+new_fixture
+(
+  cd "$DEV" || exit 1
+  mkdir -p sub
+  echo "x" > sub/marker.txt
+  git add sub/marker.txt
+  git commit -q -m "add marker"
+  git push -q origin main
+)
+run_deploy env GANGPLANK_INSTALL="marker.txt=touch ran-custom-hook.txt"
+assert_exit 0 "$DEPLOY_EXIT" "custom glob: exits 0"
+if [ -f "$HOST/sub/ran-custom-hook.txt" ]; then
+  pass "custom glob: command ran in the changed file's directory"
+else
+  fail "custom glob: command ran in the changed file's directory (marker not found)"
+fi
+
+# --- GANGPLANK_DEBUG=1 prints debug lines; unset prints none ---
+new_fixture
+run_deploy env GANGPLANK_DEBUG=1
+assert_exit 0 "$DEPLOY_EXIT" "debug on: exits 0"
+assert_contains "$DEPLOY_LOG" "debug: behind=0 ahead=0" "debug on: debug lines present"
+
+new_fixture
+run_deploy env
+assert_exit 0 "$DEPLOY_EXIT" "debug off: exits 0"
+assert_not_contains "$DEPLOY_LOG" "debug:" "debug off: no debug lines"
+
+# --- GANGPLANK_DRY_RUN=1: deploy.sh has no dry-run support, so it is
+# inert — the flag changes nothing and a real deploy still happens.
+new_fixture
+push_commit_from_dev "dry-run-flag commit"
+run_deploy env GANGPLANK_DRY_RUN=1
+assert_exit 0 "$DEPLOY_EXIT" "GANGPLANK_DRY_RUN=1: exits 0 same as without it"
+assert_contains "$DEPLOY_LOG" "PULLED 1 commit(s)" "GANGPLANK_DRY_RUN=1: still pulls for real (flag is a no-op in deploy.sh)"
+assert_eq "true" "$(gh_output_value deployed)" "GANGPLANK_DRY_RUN=1: deployed=true (not a dry run)"
+
+# --- worktree prune: gh reports MERGED for one branch, OPEN for another ---
+new_fixture
+push_commit_from_dev "worktree-prune commit"
+wt_merged="$(new_tmpdir)/wt-merged"
+wt_open="$(new_tmpdir)/wt-open"
+git -C "$HOST" worktree add -q -b feature-merged "$wt_merged" >/dev/null 2>&1
+git -C "$HOST" worktree add -q -b feature-open "$wt_open" >/dev/null 2>&1
+stub_bin gh '
+case "$1" in
+  pr)
+    head=""
+    prev=""
+    for a in "$@"; do
+      if [ "$prev" = "--head" ]; then head="$a"; fi
+      prev="$a"
+    done
+    case "$head" in
+      feature-merged) echo "42" ;;
+      *) echo "" ;;
+    esac
+    exit 0
+    ;;
+  *) exit 1 ;;
+esac
+'
+run_deploy env
+assert_exit 0 "$DEPLOY_EXIT" "worktree prune: exits 0"
+assert_contains "$DEPLOY_LOG" "worktree PRUNED" "worktree prune: log names a pruned worktree"
+assert_contains "$DEPLOY_LOG" "(feature-merged, merged PR #42)" "worktree prune: merged branch pruned with its PR number"
+assert_contains "$DEPLOY_LOG" "clean but no merged PR found, keeping" "worktree prune: open branch kept"
+if [ -d "$wt_merged" ]; then
+  fail "worktree prune: merged worktree removed (still present)"
+else
+  pass "worktree prune: merged worktree removed"
+fi
+if [ -d "$wt_open" ]; then
+  pass "worktree prune: open worktree left in place"
+else
+  fail "worktree prune: open worktree left in place (was removed)"
+fi
+if git -C "$HOST" rev-parse --verify --quiet refs/heads/feature-merged >/dev/null 2>&1; then
+  fail "worktree prune: merged local branch deleted (still exists)"
+else
+  pass "worktree prune: merged local branch deleted"
+fi
+if git -C "$HOST" rev-parse --verify --quiet refs/heads/feature-open >/dev/null 2>&1; then
+  pass "worktree prune: open local branch kept"
+else
+  fail "worktree prune: open local branch kept (was deleted)"
+fi
+
+# --- GANGPLANK_BRANCH tracks a non-main branch end to end ---
+base_nb="$(new_tmpdir)"
+ORIGIN="$base_nb/origin.git"
+HOST="$base_nb/host"
+DEV="$base_nb/dev"
+git init --bare -q "$ORIGIN"
+git -C "$ORIGIN" symbolic-ref HEAD refs/heads/main
+git clone -q "$ORIGIN" "$DEV"
+(
+  cd "$DEV" || exit 1
+  git checkout -q -b main 2>/dev/null || git checkout -q main
+  git config user.email "dev@example.com"
+  git config user.name "dev"
+  echo "hello" > README.md
+  git add README.md
+  git commit -q -m "initial commit on main"
+  git push -q origin main
+  git checkout -q -b release
+  git push -q origin release
+)
+git clone -q "$ORIGIN" "$HOST"
+(
+  cd "$HOST" || exit 1
+  git config user.email "host@example.com"
+  git config user.name "host"
+  git fetch -q origin release
+  git checkout -q release
+)
+(
+  cd "$DEV" || exit 1
+  git checkout -q release
+  echo "release work" >> README.md
+  git add README.md
+  git commit -q -m "release commit"
+  git push -q origin release
+)
+run_deploy env GANGPLANK_BRANCH=release
+assert_exit 0 "$DEPLOY_EXIT" "non-main branch: exits 0"
+assert_contains "$DEPLOY_LOG" "PULLED 1 commit(s)" "non-main branch: pulled the release-branch commit"
+release_branch_after="$(git -C "$HOST" symbolic-ref --short HEAD)"
+assert_eq "release" "$release_branch_after" "non-main branch: host stayed on release"
+readme_on_release="$(cat "$HOST/README.md")"
+assert_contains "$readme_on_release" "release work" "non-main branch: release commit content landed"
+
+
+# --- GANGPLANK_REPO points at something that is not a git checkout ---
+not_a_repo="$(new_tmpdir)/plainfolder"
+mkdir -p "$not_a_repo"
+out="$(mktemp)"; err="$(mktemp)"
+( GANGPLANK_REPO="$not_a_repo" bash "$DEPLOY_SCRIPT" ) >"$out" 2>"$err"
+notrepo_ec=$?
+notrepo_err="$(cat "$err")"
+rm -f "$out" "$err"
+assert_exit 64 "$notrepo_ec" "not a git checkout: exits 64"
+assert_contains "$notrepo_err" "is not a git checkout" "not a git checkout: clear line naming the problem"
+
+# --- AHEAD only: local unpushed commits, nothing pulled ---
+new_fixture
+(
+  cd "$HOST" || exit 1
+  echo "local only commit" >> README.md
+  git add README.md
+  git commit -q -m "local-only commit"
+)
+before_ahead_head="$(git -C "$HOST" rev-parse HEAD)"
+run_deploy env
+assert_exit 0 "$DEPLOY_EXIT" "ahead only: exits 0"
+assert_contains "$DEPLOY_LOG" "AHEAD 1 (local has un-pushed commits" "ahead only: log names the ahead-only state"
+after_ahead_head="$(git -C "$HOST" rev-parse HEAD)"
+assert_eq "$before_ahead_head" "$after_ahead_head" "ahead only: HEAD unchanged"
+assert_eq "false" "$(gh_output_value deployed)" "ahead only: deployed=false"
+
+# --- worktree prune: gh missing from PATH skips the whole step ---
+new_fixture
+push_commit_from_dev "prune-no-gh commit"
+no_gh_path="/usr/bin:/bin"
+run_deploy env PATH="$no_gh_path"
+assert_exit 0 "$DEPLOY_EXIT" "prune without gh: exits 0"
+assert_contains "$DEPLOY_LOG" "worktree prune SKIPPED — gh not on PATH" "prune without gh: log names the skip"
+
+# --- worktree prune: a locked worktree is skipped, a dirty one is skipped ---
+new_fixture
+push_commit_from_dev "prune-locked-dirty commit"
+wt_locked="$(new_tmpdir)/wt-locked"
+wt_dirty="$(new_tmpdir)/wt-dirty"
+git -C "$HOST" worktree add -q -b feature-locked "$wt_locked" >/dev/null 2>&1
+git -C "$HOST" worktree add -q -b feature-dirty "$wt_dirty" >/dev/null 2>&1
+git -C "$HOST" worktree lock "$wt_locked" >/dev/null 2>&1
+echo "uncommitted edit" >> "$wt_dirty/README.md"
+stub_bin gh 'echo ""; exit 0'
+run_deploy env
+assert_exit 0 "$DEPLOY_EXIT" "prune locked+dirty: exits 0"
+assert_contains "$DEPLOY_LOG" "(feature-locked) — locked by an active session" "prune locked+dirty: locked worktree named and skipped"
+assert_contains "$DEPLOY_LOG" "(feature-dirty) — dirty or missing" "prune locked+dirty: dirty worktree named and skipped"
+if [ -d "$wt_locked" ]; then
+  pass "prune locked+dirty: locked worktree left in place"
+else
+  fail "prune locked+dirty: locked worktree left in place (was removed)"
+fi
+if [ -d "$wt_dirty" ]; then
+  pass "prune locked+dirty: dirty worktree left in place"
+else
+  fail "prune locked+dirty: dirty worktree left in place (was removed)"
+fi
+
+
 test_summary_and_exit
