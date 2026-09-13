@@ -197,8 +197,14 @@ package-lock.json=npm install --no-audit --no-fund"
 # fragment plutil can't parse as a whole document.
 extract_plist_value() {
   local plist="$1" key="$2" val=""
+  # Trust plutil only when it exits 0. On macOS 14 a missing key or an
+  # unparseable file prints the error text on STDOUT, exactly where the
+  # value would go, so "non-empty output" is not "a value" — only the
+  # exit status says whether the text is one.
   if command -v plutil >/dev/null 2>&1; then
-    val="$(plutil -extract "${key}" raw -o - "${plist}" 2>/dev/null || true)"
+    if ! val="$(plutil -extract "${key}" raw -o - "${plist}" 2>/dev/null)"; then
+      val=""
+    fi
   fi
   if [ -z "${val}" ]; then
     val="$(grep -A1 "<key>${key}</key>" "${plist}" 2>/dev/null \
