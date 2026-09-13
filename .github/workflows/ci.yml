@@ -1,0 +1,93 @@
+# .github/workflows/ci.yml — every check runs in parallel on each PR; see
+# CONTRIBUTING.md's "What CI runs" table. Only actions/checkout and
+# codecov/codecov-action are used, both pinned by full commit SHA.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ACTIONLINT_VERSION: "1.7.12"
+  ACTIONLINT_SHA256_LINUX_AMD64: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck --severity=error bin/* examples/*.sh tests/*.sh
+
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download pinned actionlint
+        run: |
+          set -euo pipefail
+          asset="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          url="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${asset}"
+          curl -fsSL -o "${asset}" "${url}"
+          echo "${ACTIONLINT_SHA256_LINUX_AMD64}  ${asset}" | sha256sum -c -
+          tar -xzf "${asset}" actionlint
+          chmod +x actionlint
+      - name: actionlint every workflow file
+        run: |
+          set -euo pipefail
+          # action.yml is a composite-action definition, not a workflow
+          # file — actionlint has no standalone schema for it and
+          # misparses it as a malformed workflow if handed the path
+          # directly. See Makefile's lint target for the same note.
+          ./actionlint .github/workflows/*.yml
+
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash tests/run.sh
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: sudo apt-get update && sudo apt-get install -y kcov
+      - run: kcov --include-path=bin coverage tests/run.sh
+      - uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          directory: coverage
+          fail_ci_if_error: true
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  plist-lint:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Render and lint the launchd template
+        run: |
+          set -euo pipefail
+          sed \
+            -e "s|@@LABEL@@|gangplank.runner|g" \
+            -e "s|@@RUNNER_DIR@@|/tmp/gangplank-runner|g" \
+            -e "s|@@HOOK@@|/tmp/gangplank-runner/hooks/job-started-gate.sh|g" \
+            -e "s|@@ALLOWED_WORKFLOW_REF@@|owner/repo/.github/workflows/deploy.yml@refs/heads/main|g" \
+            -e "s|@@ALLOWED_REPOSITORY@@|owner/repo|g" \
+            -e "s|@@ALLOWED_REF@@|refs/heads/main|g" \
+            -e "s|@@ALLOWED_JOB@@|deploy|g" \
+            -e "s|@@LOG@@|/tmp/gangplank-runner/runner.log|g" \
+            -e "s|@@PATH@@|/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin|g" \
+            -e "s|@@HOME@@|/tmp|g" \
+            templates/launchd.plist.tmpl > /tmp/rendered.plist
+          plutil -lint /tmp/rendered.plist

@@ -1,0 +1,145 @@
+# action.yml — composite action wrapping bin/deploy.sh for the gangplank
+# self-hosted runner. The one-workflow gate lives on the runner (see
+# bin/job-started-gate.sh), not here — this file only runs the deploy and
+# handles failure/recovery commands around it.
+#
+# No `uses:` of a checkout action, and no third-party action at all: the
+# deploy acts on the LIVE checkout already sitting at `repo` (its own
+# fast-forward-from-origin logic in bin/deploy.sh), not a fresh copy in the
+# runner's ephemeral workspace. Checking out the ref here would create a
+# second, throwaway copy the deploy script never touches.
+#
+# Optional inputs default to "" here and are handed straight through to
+# bin/deploy.sh's own env, which applies ITS defaults on an empty value —
+# one source of truth for what "unset" means, not two.
+#
+# Every value a `run:` step needs is mapped into that step's `env:` and read
+# back as `$VAR` — never spliced as `${{ inputs.* }}` / `${{ steps.* }}`
+# straight into a script body. A script body carrying that text is exactly
+# the expression-injection shape actionlint flags: a value from outside this
+# file (a log line, a branch name) can land inside the literal script GitHub
+# generates and run as shell rather than as data.
+name: gangplank
+description: Fast-forward a self-hosted Mac's checkout from origin/main and run its deploy hooks.
+inputs:
+  repo:
+    description: Path to the git checkout to deploy.
+    required: true
+  branch:
+    description: Branch to track and fast-forward to.
+    required: false
+    default: "main"
+  log:
+    description: Deploy log file path. Empty uses bin/deploy.sh's own default.
+    required: false
+    default: ""
+  lock_dir:
+    description: Cross-process lock directory. Empty uses bin/deploy.sh's own default.
+    required: false
+    default: ""
+  install:
+    description: Newline "glob=command" pairs run in a changed file's directory; "none" disables; empty uses the npm-install default.
+    required: false
+    default: ""
+  services_dir:
+    description: Repo-relative folder of launchd plists to load/unload on change. Empty skips.
+    required: false
+    default: ""
+  kick:
+    description: Space-separated launchd labels to kickstart after a pull that moved HEAD. Empty skips.
+    required: false
+    default: ""
+  prune_worktrees:
+    description: Prune worktrees whose branch's PR merged. true or false.
+    required: false
+    default: "true"
+  self_label:
+    description: launchd label of the runner's own service definition; never reloaded from inside a deploy.
+    required: false
+    default: "gangplank.runner"
+  on_failure:
+    description: Command to run once when the deploy fails. Empty means no alerting.
+    required: false
+    default: ""
+  on_recovery:
+    description: Command to run once on the first successful deploy after a prior failure. Empty means no alerting.
+    required: false
+    default: ""
+  state_dir:
+    description: Directory holding the last-failed marker between runs.
+    required: false
+    default: $HOME/.gangplank
+outputs:
+  deployed:
+    description: "true if this run fast-forwarded the checkout, false otherwise."
+    value: ${{ steps.deploy.outputs.deployed }}
+  commits:
+    description: Number of commits pulled.
+    value: ${{ steps.deploy.outputs.commits }}
+runs:
+  using: composite
+  steps:
+    - name: Deploy
+      id: deploy
+      shell: bash
+      env:
+        GANGPLANK_REPO: ${{ inputs.repo }}
+        GANGPLANK_BRANCH: ${{ inputs.branch }}
+        GANGPLANK_LOG: ${{ inputs.log }}
+        GANGPLANK_LOCK_DIR: ${{ inputs.lock_dir }}
+        GANGPLANK_INSTALL: ${{ inputs.install }}
+        GANGPLANK_SERVICES_DIR: ${{ inputs.services_dir }}
+        GANGPLANK_KICK: ${{ inputs.kick }}
+        GANGPLANK_PRUNE_WORKTREES: ${{ inputs.prune_worktrees }}
+        GANGPLANK_SELF_LABEL: ${{ inputs.self_label }}
+        GANGPLANK_STDOUT: "1"
+        GANGPLANK_TRIGGER: github-actions
+        GANGPLANK_ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set +e
+        resolved_log="${GANGPLANK_LOG:-$HOME/.gangplank/deploy.log}"
+        echo "log_path=${resolved_log}" >> "${GITHUB_OUTPUT}"
+        "${GANGPLANK_ACTION_PATH}/bin/deploy.sh"
+        code=$?
+        echo "exit_code=${code}" >> "${GITHUB_OUTPUT}"
+        reason="$(tail -n 1 "${resolved_log}" 2>/dev/null || true)"
+        echo "reason=${reason}" >> "${GITHUB_OUTPUT}"
+
+    - name: Failure command
+      if: steps.deploy.outputs.exit_code != '0'
+      shell: bash
+      env:
+        GANGPLANK_STATE_DIR: ${{ inputs.state_dir }}
+        GANGPLANK_ON_FAILURE: ${{ inputs.on_failure }}
+        GANGPLANK_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GANGPLANK_SHA: ${{ github.sha }}
+        GANGPLANK_EXIT_CODE: ${{ steps.deploy.outputs.exit_code }}
+        GANGPLANK_REASON: ${{ steps.deploy.outputs.reason }}
+      run: |
+        set -uo pipefail
+        mkdir -p "$GANGPLANK_STATE_DIR"
+        echo "$GANGPLANK_RUN_URL" > "$GANGPLANK_STATE_DIR/last-failed"
+        if [ -n "$GANGPLANK_ON_FAILURE" ]; then
+          eval "$GANGPLANK_ON_FAILURE"
+        fi
+        exit "$GANGPLANK_EXIT_CODE"
+
+    - name: Recovery command
+      if: steps.deploy.outputs.exit_code == '0'
+      shell: bash
+      env:
+        GANGPLANK_STATE_DIR: ${{ inputs.state_dir }}
+        GANGPLANK_ON_RECOVERY: ${{ inputs.on_recovery }}
+        GANGPLANK_DEPLOYED: ${{ steps.deploy.outputs.deployed }}
+        GANGPLANK_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        GANGPLANK_SHA: ${{ github.sha }}
+        GANGPLANK_EXIT_CODE: "0"
+      run: |
+        set -uo pipefail
+        marker="$GANGPLANK_STATE_DIR/last-failed"
+        if [ -f "$marker" ] && [ "$GANGPLANK_DEPLOYED" = "true" ]; then
+          if [ -n "$GANGPLANK_ON_RECOVERY" ]; then
+            eval "$GANGPLANK_ON_RECOVERY"
+          fi
+          rm -f "$marker"
+        fi

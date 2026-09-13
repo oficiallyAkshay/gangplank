@@ -24,6 +24,35 @@ The runner and git do the transport. gangplank adds what neither does:
 - **Parallel-session cleanup that cannot delete live work.** A worktree goes only when its PR merged, its tree is clean, and no session holds it.
 - **Failure-only alerting, to whatever you point it at.** On a failed deploy it runs the command you name, once; on the first real deploy after that it runs your recovery command. Nothing on success, and nothing at all if you name no command; the red run on GitHub is the record.
 
+## Use it
+
+On the Mac, once:
+
+```bash
+git clone https://github.com/oficiallyAkshay/gangplank ~/.gangplank/src
+~/.gangplank/src/bin/gangplank install --repo you/your-repo
+```
+
+That registers a GitHub runner on the machine, runs it as a launchd service, and places the gate outside any checkout so no branch can edit it. `gangplank status`, `gangplank dry-run` and `gangplank uninstall` are the other three verbs.
+
+In your repo, the deploy workflow (full version with every option in `examples/deploy.yml`):
+
+```yaml
+on:
+  push: { branches: [main] }
+  schedule: [{ cron: "17 * * * *" }]
+concurrency: { group: deploy, cancel-in-progress: false }
+jobs:
+  deploy:
+    runs-on: [self-hosted, macOS, gangplank]
+    steps:
+      - uses: oficiallyAkshay/gangplank@v0
+        with:
+          repo: /Users/you/your-checkout
+```
+
+Merge to main, and the Mac has it in seconds.
+
 ## How it sits
 
 Nothing on the Mac listens to the internet. The runner asks GitHub for work over an outbound connection, and the gate decides whether that work may run.

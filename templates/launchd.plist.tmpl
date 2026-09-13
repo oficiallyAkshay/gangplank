@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  @@LABEL@@ — the LaunchAgent that keeps the GitHub Actions self-hosted
+  runner running on this Mac. Rendered from this template by
+  bin/install-runner.sh, which fills in every placeholder below.
+
+  The runner binary lives at @@RUNNER_DIR@@, outside any git checkout, so a
+  merged branch has no path to edit the program this plist launches. The
+  same is true of @@HOOK@@, the one-job gate named in
+  ACTIONS_RUNNER_HOOK_JOB_STARTED below.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>@@LABEL@@</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <!-- `-c`, not `-lc`: a login shell runs /etc/profile, which runs
+         path_helper and reorders this PATH's entries behind the system
+         defaults for every child process. `-c` skips /etc/profile
+         entirely, so the PATH below is what the runner and its jobs
+         actually see. -->
+    <string>cd "@@RUNNER_DIR@@" &amp;&amp; exec ./run.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>@@RUNNER_DIR@@</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>@@HOME@@</string>
+    <key>PATH</key>
+    <string>@@PATH@@</string>
+    <key>ACTIONS_RUNNER_HOOK_JOB_STARTED</key>
+    <string>@@HOOK@@</string>
+    <key>GANGPLANK_ALLOWED_WORKFLOW_REF</key>
+    <string>@@ALLOWED_WORKFLOW_REF@@</string>
+    <key>GANGPLANK_ALLOWED_REPOSITORY</key>
+    <string>@@ALLOWED_REPOSITORY@@</string>
+    <key>GANGPLANK_ALLOWED_REF</key>
+    <string>@@ALLOWED_REF@@</string>
+    <key>GANGPLANK_ALLOWED_JOB</key>
+    <string>@@ALLOWED_JOB@@</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>@@LOG@@</string>
+
+  <key>StandardErrorPath</key>
+  <string>@@LOG@@</string>
+</dict>
+</plist>

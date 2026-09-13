@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# bin/gangplank — CLI dispatcher for install / status / dry-run / uninstall.
+#
+# `dry-run` runs `install --dry-run` plus, when GANGPLANK_REPO is set in
+# the environment, bin/deploy.sh (owned by a sibling script in this repo)
+# with GANGPLANK_DRY_RUN=1 in its environment so it can honor the same
+# no-op contract — deploy.sh itself decides what that env var means.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+  cat <<'USAGE'
+usage: gangplank <verb> [flags]
+
+verbs:
+  install    install and register the self-hosted runner (see bin/install-runner.sh --help)
+  status     print runner and deploy status (see bin/status.sh --help)
+  dry-run    install --dry-run, plus a deploy.sh --dry-run when GANGPLANK_REPO is set
+  uninstall  stop and deregister the runner (see bin/uninstall-runner.sh --help)
+USAGE
+}
+
+[ $# -ge 1 ] || { usage >&2; exit 64; }
+
+VERB="$1"
+shift
+
+case "${VERB}" in
+  install)
+    exec "${SCRIPT_DIR}/install-runner.sh" "$@"
+    ;;
+  status)
+    exec "${SCRIPT_DIR}/status.sh" "$@"
+    ;;
+  uninstall)
+    exec "${SCRIPT_DIR}/uninstall-runner.sh" "$@"
+    ;;
+  dry-run)
+    "${SCRIPT_DIR}/install-runner.sh" --dry-run "$@"
+    if [ -n "${GANGPLANK_REPO:-}" ] && [ -x "${SCRIPT_DIR}/deploy.sh" ]; then
+      echo "gangplank: running deploy.sh --dry-run with GANGPLANK_DRY_RUN=1 (honored by deploy.sh itself)"
+      GANGPLANK_DRY_RUN=1 "${SCRIPT_DIR}/deploy.sh" --dry-run
+    fi
+    ;;
+  --help|-h|help)
+    usage
+    exit 0
+    ;;
+  *)
+    echo "gangplank: unknown verb: ${VERB}" >&2
+    usage >&2
+    exit 64
+    ;;
+esac

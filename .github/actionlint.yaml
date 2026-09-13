@@ -1,0 +1,6 @@
+# .github/actionlint.yaml — declares the custom self-hosted runner label this
+# repo's own example workflow (examples/deploy.yml) uses, so actionlint does
+# not flag it as an unknown GitHub-hosted runner label.
+self-hosted-runner:
+  labels:
+    - gangplank
