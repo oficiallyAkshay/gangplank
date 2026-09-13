@@ -354,7 +354,11 @@ until mkdir "${LOCK_DIR}" 2>/dev/null; do
       continue
     fi
   elif [ -e "${LOCK_DIR}" ]; then
-    lock_mtime="$(stat -f %m "${LOCK_DIR}" 2>/dev/null || stat -c %Y "${LOCK_DIR}" 2>/dev/null || echo "")"
+    # GNU stat first: on Linux `stat -f %m` is the filesystem's mount point,
+    # not an mtime, and BSD stat rejects -c, so each form fails cleanly on the
+    # other platform. A non-numeric answer is treated as unknown, never aged.
+    lock_mtime="$(stat -c %Y "${LOCK_DIR}" 2>/dev/null || stat -f %m "${LOCK_DIR}" 2>/dev/null || echo "")"
+    case "${lock_mtime}" in *[!0-9]*|"") lock_mtime="" ;; esac
     if [ -n "${lock_mtime}" ] && [ $(( $(date +%s) - lock_mtime )) -ge 600 ]; then
       log "stale lock with no pid file removed"
       rm -rf "${LOCK_DIR}" 2>/dev/null || true
