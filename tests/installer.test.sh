@@ -98,4 +98,430 @@ $mismatch_err"
 assert_contains "$combined" "sha256 mismatch" "sha256 mismatch: refusal line names it"
 assert_not_contains "$combined" "config.sh" "sha256 mismatch: never reaches registration (config.sh)"
 
+# =====================================================================
+# Real (non-dry-run) install flow. curl/tar/gh/launchctl/plutil are all
+# stubbed; shasum is the REAL binary (used both to compute the fixture's
+# expected hash and, inside the script, to verify it — consistent either
+# way since it's the same implementation on both sides).
+# =====================================================================
+
+FIXTURE_TARBALL_CONTENT="FIXTURE_TARBALL_CONTENT_v1"
+FIXTURE_SHA256="$(printf '%s' "$FIXTURE_TARBALL_CONTENT" | shasum -a 256 | awk '{print $1}')"
+
+stub_curl_fixture() {
+  stub_bin curl '
+out_path=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out_path="$a"; fi
+  prev="$a"
+done
+[ -n "$out_path" ] && printf "%s" "${GANGPLANK_TEST_TARBALL_CONTENT:-FIXTURE_TARBALL_CONTENT_v1}" > "$out_path"
+exit 0
+'
+}
+
+stub_tar_fixture() {
+  # Emulates extracting the real actions/runner tarball: drops an
+  # executable bin/Runner.Listener, a config.sh that records its argv to
+  # $CONFIG_CALLS_LOG and touches a real .runner file, and a no-op run.sh.
+  stub_bin tar '
+dir=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-C" ]; then dir="$a"; fi
+  prev="$a"
+done
+mkdir -p "$dir/bin"
+: > "$dir/bin/Runner.Listener"
+chmod +x "$dir/bin/Runner.Listener"
+cat > "$dir/config.sh" <<CONFIGEOF
+#!/usr/bin/env bash
+echo "config.sh args: \$*" >> "\${CONFIG_CALLS_LOG:-/dev/null}"
+printf "{\"gitHubUrl\": \"https://github.com/fixture/repo\"}" > "\$(dirname "\$0")/.runner"
+exit 0
+CONFIGEOF
+chmod +x "$dir/config.sh"
+cat > "$dir/run.sh" <<RUNEOF
+#!/usr/bin/env bash
+exit 0
+RUNEOF
+chmod +x "$dir/run.sh"
+exit 0
+'
+}
+
+stub_gh_registration_ok() {
+  stub_bin gh '
+case "$1" in
+  auth) exit 0 ;;
+  api)
+    for a in "$@"; do
+      case "$a" in
+        *registration-token*) echo "gh-fake-registration-token"; exit 0 ;;
+      esac
+    done
+    echo "gh-fake-token"
+    exit 0
+    ;;
+  *) exit 1 ;;
+esac
+'
+}
+
+stub_launchctl_stateful() {
+  # print reports "running" once bootstrap has been called (tracked via a
+  # state file); bootout clears that state. Every call is logged.
+  stub_bin launchctl '
+state_file="${LAUNCHCTL_STATE_FILE:-}"
+case "$1" in
+  print)
+    if [ -n "$state_file" ] && [ -f "$state_file" ]; then
+      # state = running is printed LAST, not first: the verify step in
+      # install-runner.sh pipes this through grep -q, which exits the
+      # instant it sees a match. If anything were printed AFTER that
+      # match, a slow writer (e.g. under GANGPLANK_TRACE_FILE tracing,
+      # which adds a DEBUG-trap printf before every line) can still be
+      # mid-write when grep closes its end of the pipe, earning a SIGPIPE
+      # that pipefail then reports as a failure even though grep matched.
+      # Printing the matched line last avoids the race entirely.
+      echo "pid = 4242"
+      echo "state = running"
+      exit 0
+    else
+      exit 1
+    fi
+    ;;
+  bootstrap)
+    [ -n "$state_file" ] && touch "$state_file"
+    echo "launchctl $*" >> "${LAUNCHCTL_CALLS_LOG:-/dev/null}"
+    exit 0
+    ;;
+  bootout)
+    [ -n "$state_file" ] && rm -f "$state_file"
+    echo "launchctl $*" >> "${LAUNCHCTL_CALLS_LOG:-/dev/null}"
+    exit 0
+    ;;
+  *)
+    echo "launchctl $*" >> "${LAUNCHCTL_CALLS_LOG:-/dev/null}"
+    exit 0
+    ;;
+esac
+'
+}
+
+stub_plutil_fixture() {
+  # -extract <field> raw [-o -] <plist> — the last argument is always the
+  # plist path regardless of which flags precede it.
+  stub_bin plutil '
+case "$1" in
+  -extract)
+    field="$2"
+    shift 2
+    plist=""
+    for a in "$@"; do plist="$a"; done
+    case "$field" in
+      WorkingDirectory)
+        grep -A1 "<key>WorkingDirectory</key>" "$plist" | tail -n1 | sed -e "s/^[[:space:]]*<string>//" -e "s/<\/string>[[:space:]]*$//"
+        ;;
+      EnvironmentVariables.ACTIONS_RUNNER_HOOK_JOB_STARTED)
+        grep -A1 "<key>ACTIONS_RUNNER_HOOK_JOB_STARTED</key>" "$plist" | tail -n1 | sed -e "s/^[[:space:]]*<string>//" -e "s/<\/string>[[:space:]]*$//"
+        ;;
+      *) exit 1 ;;
+    esac
+    exit 0
+    ;;
+  -lint) exit 0 ;;
+  *) exit 0 ;;
+esac
+'
+}
+
+run_install_real() {
+  # args: any env assignments, then the flags for install-runner.sh after
+  # a literal "--".
+  local envs=() flags=() seen_dashdash=0
+  local a
+  for a in "$@"; do
+    if [ "$seen_dashdash" -eq 1 ]; then
+      flags+=("$a")
+    elif [ "$a" = "--" ]; then
+      seen_dashdash=1
+    else
+      envs+=("$a")
+    fi
+  done
+  local out err ec
+  out="$(mktemp)"; err="$(mktemp)"
+  env "${envs[@]}" bash "$INSTALLER" "${flags[@]}" >"$out" 2>"$err"
+  ec=$?
+  INSTALL_STDOUT="$(cat "$out")$(cat "$err")"
+  INSTALL_EXIT="$ec"
+  rm -f "$out" "$err"
+}
+INSTALL_STDOUT=""
+INSTALL_EXIT=""
+
+# --- fresh install end to end, through the verify step ---
+stub_curl_fixture
+stub_tar_fixture
+stub_gh_registration_ok
+stub_launchctl_stateful
+stub_plutil_fixture
+home_a="$(new_tmpdir)"
+runner_dir_a="$home_a/runner"
+config_calls_a="$(new_tmpdir)/config-calls.log"; : > "$config_calls_a"
+launchctl_calls_a="$(new_tmpdir)/launchctl-calls.log"; : > "$launchctl_calls_a"
+launchctl_state_a="$(new_tmpdir)/launchctl-state"
+run_install_real HOME="$home_a" CONFIG_CALLS_LOG="$config_calls_a" \
+  LAUNCHCTL_CALLS_LOG="$launchctl_calls_a" LAUNCHCTL_STATE_FILE="$launchctl_state_a" \
+  GANGPLANK_TEST_RUNNER_VERSION="1.2.3-fixture" GANGPLANK_TEST_RUNNER_SHA256="$FIXTURE_SHA256" \
+  GANGPLANK_TEST_SKIP_PLATFORM_CHECK=1 \
+  -- --repo owner/repo --runner-dir "$runner_dir_a"
+assert_exit 0 "$INSTALL_EXIT" "fresh install: exits 0"
+assert_contains "$INSTALL_STDOUT" "verified: gangplank.runner running, hook sha256 matches repo" "fresh install: verify step passes"
+if [ -x "$runner_dir_a/hooks/job-started-gate.sh" ]; then
+  pass "fresh install: hook installed and executable"
+else
+  fail "fresh install: hook installed and executable"
+fi
+assert_contains "$(cat "$runner_dir_a/.env" 2>/dev/null || true)" "ACTIONS_RUNNER_HOOK_JOB_STARTED=" "fresh install: .env carries the hook path"
+if [ -f "$home_a/Library/LaunchAgents/gangplank.runner.plist" ]; then
+  pass "fresh install: plist rendered into Library/LaunchAgents"
+else
+  fail "fresh install: plist rendered into Library/LaunchAgents"
+fi
+launchctl_calls_a_content="$(cat "$launchctl_calls_a")"
+assert_contains "$launchctl_calls_a_content" "bootstrap" "fresh install: launchctl bootstrap called"
+config_calls_a_content="$(cat "$config_calls_a")"
+assert_contains "$config_calls_a_content" "--unattended" "fresh install: config.sh called with --unattended"
+assert_contains "$config_calls_a_content" "gh-fake-registration-token" "fresh install: config.sh received the registration token"
+
+# --- version-change path: bootout only when the installed plist's
+# WorkingDirectory matches this run's --runner-dir ---
+stub_curl_fixture
+stub_tar_fixture
+stub_gh_registration_ok
+stub_launchctl_stateful
+stub_plutil_fixture
+
+# matching case: bootout happens
+home_b="$(new_tmpdir)"
+runner_dir_b="$home_b/runner"
+mkdir -p "$runner_dir_b" "$home_b/Library/LaunchAgents"
+printf 'old-version' > "$runner_dir_b/.runner-version"
+: > "$runner_dir_b/bin_marker_unused"
+plist_b="$home_b/Library/LaunchAgents/gangplank.runner.plist"
+{
+  echo '<?xml version="1.0"?>'
+  echo '<plist><dict>'
+  echo '  <key>WorkingDirectory</key>'
+  echo "  <string>${runner_dir_b}</string>"
+  echo '</dict></plist>'
+} > "$plist_b"
+launchctl_state_b="$(new_tmpdir)/launchctl-state"; touch "$launchctl_state_b"
+launchctl_calls_b="$(new_tmpdir)/launchctl-calls.log"; : > "$launchctl_calls_b"
+run_install_real HOME="$home_b" LAUNCHCTL_CALLS_LOG="$launchctl_calls_b" LAUNCHCTL_STATE_FILE="$launchctl_state_b" \
+  GANGPLANK_TEST_RUNNER_VERSION="2.0.0-fixture" GANGPLANK_TEST_RUNNER_SHA256="$FIXTURE_SHA256" \
+  GANGPLANK_TEST_SKIP_PLATFORM_CHECK=1 \
+  -- --repo owner/repo --runner-dir "$runner_dir_b"
+assert_contains "$INSTALL_STDOUT" "version change — booting out" "version change (matching dir): log names the bootout"
+launchctl_calls_b_content="$(cat "$launchctl_calls_b")"
+matching_bootout_count="$(printf '%s\n' "$launchctl_calls_b_content" | grep -c "bootout gui/$(id -u)/gangplank.runner")"
+# Section 1's version-change bootout clears the (stubbed) loaded state, so
+# section 4's own always-bootout-if-loaded check then finds it already
+# unloaded and skips its own call — exactly one bootout either way; what
+# differs between this case and the mismatched one below is WHICH step
+# logged it (asserted above) and, for the mismatched case, whether the
+# version-change step's bootout ran at all.
+assert_eq "1" "$matching_bootout_count" "version change (matching dir): bootout ran once (from the version-change check)"
+
+# mismatched case: installed plist points elsewhere, bootout skipped
+home_c="$(new_tmpdir)"
+runner_dir_c="$home_c/runner"
+mkdir -p "$runner_dir_c" "$home_c/Library/LaunchAgents"
+printf 'old-version' > "$runner_dir_c/.runner-version"
+plist_c="$home_c/Library/LaunchAgents/gangplank.runner.plist"
+{
+  echo '<?xml version="1.0"?>'
+  echo '<plist><dict>'
+  echo '  <key>WorkingDirectory</key>'
+  echo "  <string>/some/other/runner/dir</string>"
+  echo '</dict></plist>'
+} > "$plist_c"
+launchctl_state_c="$(new_tmpdir)/launchctl-state"; touch "$launchctl_state_c"
+launchctl_calls_c="$(new_tmpdir)/launchctl-calls.log"; : > "$launchctl_calls_c"
+run_install_real HOME="$home_c" LAUNCHCTL_CALLS_LOG="$launchctl_calls_c" LAUNCHCTL_STATE_FILE="$launchctl_state_c" \
+  GANGPLANK_TEST_RUNNER_VERSION="2.0.0-fixture" GANGPLANK_TEST_RUNNER_SHA256="$FIXTURE_SHA256" \
+  GANGPLANK_TEST_SKIP_PLATFORM_CHECK=1 \
+  -- --repo owner/repo --runner-dir "$runner_dir_c"
+assert_contains "$INSTALL_STDOUT" "skipping bootout: installed runner dir is" "version change (mismatched dir): log names the skip"
+launchctl_calls_c_content="$(cat "$launchctl_calls_c")"
+# Section 4 (render+load) always boots out an already-loaded label before
+# re-bootstrapping it, regardless of the version-change logic in section
+# 1 — so the mismatched case still shows ONE bootout call (from section
+# 4), while the matching case above shows TWO (section 1's version-change
+# bootout, plus section 4's). The count is what distinguishes them.
+mismatched_bootout_count="$(printf '%s\n' "$launchctl_calls_c_content" | grep -c "bootout gui/$(id -u)/gangplank.runner")"
+assert_eq "1" "$mismatched_bootout_count" "version change (mismatched dir): only section 4's own bootout ran, not an extra one from the version-change check"
+
+# --- idempotent second run: no re-download, no re-register ---
+stub_bin curl 'echo "curl should not be called on an idempotent run" >&2; exit 9'
+stub_bin gh 'echo "gh should not be called on an idempotent run" >&2; exit 9'
+stub_launchctl_stateful
+stub_plutil_fixture
+run_install_real HOME="$home_a" LAUNCHCTL_CALLS_LOG="$(new_tmpdir)/launchctl-calls.log" LAUNCHCTL_STATE_FILE="$launchctl_state_a" \
+  GANGPLANK_TEST_RUNNER_VERSION="1.2.3-fixture" GANGPLANK_TEST_RUNNER_SHA256="$FIXTURE_SHA256" \
+  GANGPLANK_TEST_SKIP_PLATFORM_CHECK=1 \
+  -- --repo owner/repo --runner-dir "$runner_dir_a"
+assert_exit 0 "$INSTALL_EXIT" "idempotent second run: exits 0"
+assert_contains "$INSTALL_STDOUT" "already extracted" "idempotent second run: skips the download"
+assert_contains "$INSTALL_STDOUT" "already exists — skipping registration" "idempotent second run: skips registration"
+assert_not_contains "$INSTALL_STDOUT" "should not be called" "idempotent second run: neither curl nor gh was invoked"
+
+# --- unauthenticated gh refuses registration (after a fresh extraction) ---
+stub_curl_fixture
+stub_tar_fixture
+stub_bin gh '
+case "$1" in
+  auth) exit 1 ;;
+  *) exit 1 ;;
+esac
+'
+stub_launchctl_stateful
+stub_plutil_fixture
+home_d="$(new_tmpdir)"
+runner_dir_d="$home_d/runner"
+run_install_real HOME="$home_d" \
+  GANGPLANK_TEST_RUNNER_VERSION="3.0.0-fixture" GANGPLANK_TEST_RUNNER_SHA256="$FIXTURE_SHA256" \
+  GANGPLANK_TEST_SKIP_PLATFORM_CHECK=1 \
+  -- --repo owner/repo --runner-dir "$runner_dir_d"
+if [ "$INSTALL_EXIT" -eq 0 ]; then
+  fail "unauthenticated gh: exits non-zero (got 0)"
+else
+  pass "unauthenticated gh: exits non-zero"
+fi
+assert_contains "$INSTALL_STDOUT" "an authenticated 'gh' is required to request a registration token" "unauthenticated gh: clear refusal line"
+if [ -f "$home_d/Library/LaunchAgents/gangplank.runner.plist" ]; then
+  fail "unauthenticated gh: never reaches the plist render step (plist exists)"
+else
+  pass "unauthenticated gh: never reaches the plist render step"
+fi
+
+# --- .env key replacement keeps unrelated lines, replaces gangplank keys ---
+stub_launchctl_stateful
+stub_plutil_fixture
+home_e="$(new_tmpdir)"
+runner_dir_e="$home_e/runner"
+mkdir -p "$runner_dir_e/bin"
+: > "$runner_dir_e/bin/Runner.Listener"
+chmod +x "$runner_dir_e/bin/Runner.Listener"
+printf '4.0.0-fixture' > "$runner_dir_e/.runner-version"
+printf '{"gitHubUrl": "https://github.com/owner/repo"}' > "$runner_dir_e/.runner"
+printf 'MY_CUSTOM_VAR=hello\nGANGPLANK_ALLOWED_JOB=stale-job\n' > "$runner_dir_e/.env"
+launchctl_state_e="$(new_tmpdir)/launchctl-state"
+run_install_real HOME="$home_e" LAUNCHCTL_STATE_FILE="$launchctl_state_e" \
+  GANGPLANK_TEST_RUNNER_VERSION="4.0.0-fixture" GANGPLANK_TEST_RUNNER_SHA256="$FIXTURE_SHA256" \
+  GANGPLANK_TEST_SKIP_PLATFORM_CHECK=1 \
+  -- --repo owner/repo --runner-dir "$runner_dir_e"
+assert_exit 0 "$INSTALL_EXIT" ".env replacement: exits 0 (no curl/gh stub needed — already extracted and registered)"
+env_e_content="$(cat "$runner_dir_e/.env" 2>/dev/null || true)"
+assert_contains "$env_e_content" "MY_CUSTOM_VAR=hello" ".env replacement: unrelated line preserved"
+assert_contains "$env_e_content" "GANGPLANK_ALLOWED_JOB=deploy" ".env replacement: gangplank-managed key updated to the new value"
+assert_not_contains "$env_e_content" "stale-job" ".env replacement: stale gangplank-managed value removed"
+
+
+# --- dry-run: --name/--labels/--workflow/--branch/--job/--path are parsed ---
+stub_gh_ok
+out="$(mktemp)"; err="$(mktemp)"
+bash "$INSTALLER" --repo owner/repo --runner-dir "$(new_tmpdir)/runner" \
+  --name my-runner --labels extra --workflow custom.yml --branch release \
+  --job build --path /custom/path --dry-run >"$out" 2>"$err"
+flags_ec=$?
+flags_out="$(cat "$out")$(cat "$err")"
+rm -f "$out" "$err"
+assert_exit 0 "$flags_ec" "dry-run with every flag: exits 0"
+assert_contains "$flags_out" "--name my-runner" "dry-run with every flag: --name flows into the planned config.sh call"
+assert_contains "$flags_out" "self-hosted,macOS,extra" "dry-run with every flag: --labels flows into the planned config.sh call"
+
+# --- unknown argument ---
+out="$(mktemp)"; err="$(mktemp)"
+bash "$INSTALLER" --repo owner/repo --bogus-flag >"$out" 2>"$err"
+unknown_ec=$?
+unknown_out="$(cat "$out")$(cat "$err")"
+rm -f "$out" "$err"
+if [ "$unknown_ec" -eq 0 ]; then
+  fail "unknown flag: exits non-zero (got 0)"
+else
+  pass "unknown flag: exits non-zero"
+fi
+assert_contains "$unknown_out" "unknown argument" "unknown flag: clear line naming the problem"
+
+# --- non-arm64 platform: dry-run notes it, real run refuses ---
+stub_bin uname 'if [ "$1" = "-m" ]; then echo "x86_64"; else /usr/bin/uname "$@"; fi'
+stub_gh_ok
+out="$(mktemp)"; err="$(mktemp)"
+bash "$INSTALLER" --repo owner/repo --runner-dir "$(new_tmpdir)/runner" --dry-run >"$out" 2>"$err"
+nonarm_dryrun_ec=$?
+nonarm_dryrun_out="$(cat "$out")$(cat "$err")"
+rm -f "$out" "$err"
+assert_exit 0 "$nonarm_dryrun_ec" "non-arm64 dry-run: still exits 0"
+assert_contains "$nonarm_dryrun_out" "this host would be refused" "non-arm64 dry-run: notes the refusal without aborting"
+
+out="$(mktemp)"; err="$(mktemp)"
+bash "$INSTALLER" --repo owner/repo --runner-dir "$(new_tmpdir)/runner" >"$out" 2>"$err"
+nonarm_real_ec=$?
+nonarm_real_out="$(cat "$out")$(cat "$err")"
+rm -f "$out" "$err"
+if [ "$nonarm_real_ec" -eq 0 ]; then
+  fail "non-arm64 real run: exits non-zero (got 0)"
+else
+  pass "non-arm64 real run: exits non-zero"
+fi
+assert_contains "$nonarm_real_out" "refused — this Mac is not arm64" "non-arm64 real run: refuses before touching anything"
+
+# --- dry-run: already-extracted and already-registered plan lines ---
+stub_gh_ok
+already_dir="$(new_tmpdir)/runner"
+mkdir -p "$already_dir/bin"
+: > "$already_dir/bin/Runner.Listener"
+chmod +x "$already_dir/bin/Runner.Listener"
+printf '9.9.9-already' > "$already_dir/.runner-version"
+printf '{"gitHubUrl": "https://github.com/owner/repo"}' > "$already_dir/.runner"
+out="$(mktemp)"; err="$(mktemp)"
+GANGPLANK_TEST_RUNNER_VERSION="9.9.9-already" \
+  bash "$INSTALLER" --repo owner/repo --runner-dir "$already_dir" --dry-run >"$out" 2>"$err"
+already_ec=$?
+already_out="$(cat "$out")$(cat "$err")"
+rm -f "$out" "$err"
+assert_exit 0 "$already_ec" "dry-run already extracted+registered: exits 0"
+assert_contains "$already_out" "already extracted at $already_dir — would skip download" "dry-run: notes the extraction would be skipped"
+assert_contains "$already_out" "already exists — would skip registration" "dry-run: notes the registration would be skipped"
+
+# --- verify catches a launchd state that never comes up ---
+stub_curl_fixture
+stub_tar_fixture
+stub_gh_registration_ok
+stub_bin launchctl '
+case "$1" in
+  print) exit 1 ;;
+  *) exit 0 ;;
+esac
+'
+stub_plutil_fixture
+home_f="$(new_tmpdir)"
+runner_dir_f="$home_f/runner"
+run_install_real HOME="$home_f" \
+  GANGPLANK_TEST_RUNNER_VERSION="5.0.0-fixture" GANGPLANK_TEST_RUNNER_SHA256="$FIXTURE_SHA256" \
+  GANGPLANK_TEST_SKIP_PLATFORM_CHECK=1 \
+  -- --repo owner/repo --runner-dir "$runner_dir_f"
+if [ "$INSTALL_EXIT" -eq 0 ]; then
+  fail "verify catches state never running: exits non-zero (got 0)"
+else
+  pass "verify catches state never running: exits non-zero"
+fi
+assert_contains "$INSTALL_STDOUT" "verify FAILED" "verify catches state never running: names the failure"
+assert_contains "$INSTALL_STDOUT" "does not show state = running" "verify catches state never running: names the specific check"
+
+
 test_summary_and_exit
