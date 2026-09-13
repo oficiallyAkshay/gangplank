@@ -103,6 +103,56 @@ gh_output_value() {
   printf '%s\n' "$DEPLOY_GH_OUTPUT" | sed -n "s/^$1=//p" | tail -n1
 }
 
+# bindir_without NAME... — builds a PATH dir containing symlinks for the
+# common external commands bin/deploy.sh or this harness shells out to,
+# excluding the given NAME(s). Same rationale as the "no gh" case above:
+# a hardcoded low-level PATH (e.g. /usr/bin:/bin) isn't reliable across
+# hosts — plutil lives at /usr/bin on a Mac and doesn't exist at all on
+# ubuntu-latest, so build the allowlist from whatever's actually on PATH
+# right now and just leave the excluded name(s) out of it.
+bindir_without() {
+  local exclude=" $* "
+  local dir tool tool_path
+  dir="$(new_tmpdir)/bin-without"
+  mkdir -p "$dir"
+  for tool in bash git date mkdir rm cat grep sed sort tr basename dirname \
+              id sleep kill printf cp mv cut head stat gh env true false; do
+    case "$exclude" in
+      *" $tool "*) continue ;;
+    esac
+    tool_path="$(command -v "$tool" 2>/dev/null || true)"
+    [ -n "$tool_path" ] && ln -s "$tool_path" "$dir/$tool"
+  done
+  printf '%s\n' "$dir"
+}
+
+# fake_git_failing PATTERN — writes a `git` wrapper into a fresh temp dir
+# that exits 1 when its full argument list (as "$*") matches the given
+# case-glob PATTERN (e.g. 'stash push*', or 'merge --ff-only*|stash pop'
+# to fail on either), and otherwise execs the real git untouched. Only
+# ever put on PATH for the one run_deploy call that needs it — everything
+# else in a test (fixture setup, assertions afterward) keeps using the
+# real git directly.
+fake_git_failing() {
+  local pattern="$1" dir real_git esc_pattern
+  # Case patterns are single words — an unescaped space would split
+  # "checkout main" into two tokens and break the parse, so literal
+  # spaces are escaped here while "*" and the "|" alternation stay bare.
+  esc_pattern="$(printf '%s' "$pattern" | sed 's/ /\\ /g')"
+  dir="$(new_tmpdir)/fake-git-bin"
+  mkdir -p "$dir"
+  real_git="$(command -v git)"
+  cat > "$dir/git" <<EOF
+#!/usr/bin/env bash
+case "\$*" in
+  $esc_pattern) exit 1 ;;
+esac
+exec "$real_git" "\$@"
+EOF
+  chmod +x "$dir/git"
+  printf '%s\n' "$dir"
+}
+
 # --- up to date ---
 new_fixture
 run_deploy env
@@ -175,6 +225,68 @@ current_branch="$(git -C "$HOST" symbolic-ref --short HEAD)"
 assert_eq "main" "$current_branch" "stranded branch: host switched back to main"
 assert_exit 0 "$DEPLOY_EXIT" "stranded branch: exits 0"
 
+# --- stranded branch, but the checkout back to main itself fails ---------
+new_fixture
+(
+  cd "$DEV" || exit 1
+  git checkout -q -b feature2
+  echo "feature2 work" >> README.md
+  git add README.md
+  git commit -q -m "feature2 commit"
+  git push -q origin feature2
+)
+(
+  cd "$HOST" || exit 1
+  git fetch -q origin feature2
+  git checkout -q feature2
+)
+(
+  cd "$DEV" || exit 1
+  git checkout -q main
+  git merge -q --squash feature2
+  git commit -q -m "squash-merge feature2"
+  git push -q origin main
+  git push -q origin --delete feature2
+)
+selfheal_fail_git="$(fake_git_failing 'checkout main')"
+before_selfheal_fail_branch="$(git -C "$HOST" symbolic-ref --short HEAD)"
+run_deploy env PATH="$selfheal_fail_git:$PATH"
+assert_exit 4 "$DEPLOY_EXIT" "self-heal checkout failure: exits 4"
+assert_contains "$DEPLOY_LOG" "SELF-HEAL FAILED: could not checkout main from feature2" "self-heal checkout failure: log names the failure"
+after_selfheal_fail_branch="$(git -C "$HOST" symbolic-ref --short HEAD)"
+assert_eq "$before_selfheal_fail_branch" "$after_selfheal_fail_branch" "self-heal checkout failure: still stranded on the old branch"
+
+# --- stranded branch heals to main, but deleting the old branch fails ---
+# (checkout succeeds; only `git branch -D` fails — non-fatal, logged.)
+new_fixture
+(
+  cd "$DEV" || exit 1
+  git checkout -q -b feature3
+  echo "feature3 work" >> README.md
+  git add README.md
+  git commit -q -m "feature3 commit"
+  git push -q origin feature3
+)
+(
+  cd "$HOST" || exit 1
+  git fetch -q origin feature3
+  git checkout -q feature3
+)
+(
+  cd "$DEV" || exit 1
+  git checkout -q main
+  git merge -q --squash feature3
+  git commit -q -m "squash-merge feature3"
+  git push -q origin main
+  git push -q origin --delete feature3
+)
+branchdeletefail_git="$(fake_git_failing 'branch -D feature3')"
+run_deploy env PATH="$branchdeletefail_git:$PATH"
+assert_exit 0 "$DEPLOY_EXIT" "self-heal, branch delete fails: exits 0 (checkout itself still worked)"
+branchdeletefail_current_branch="$(git -C "$HOST" symbolic-ref --short HEAD)"
+assert_eq "main" "$branchdeletefail_current_branch" "self-heal, branch delete fails: host still switched to main"
+assert_contains "$DEPLOY_LOG" "SELF-HEAL: kept stale local branch feature3 (delete failed, non-fatal)" "self-heal, branch delete fails: log names the non-fatal keep"
+
 # --- hook failure: exit 2, pull still happened, later hooks/prune still ran ---
 new_fixture
 (
@@ -236,6 +348,22 @@ sleep 1
 run_deploy env GANGPLANK_LOCK_DIR="$lockdir2"
 assert_contains "$DEPLOY_LOG" "stale lock" "stale lock: log mentions stale lock removal"
 assert_exit 0 "$DEPLOY_EXIT" "stale lock: deploy still proceeds"
+
+# --- stale lock with NO pid file at all (aged past the 600s cap) -------
+# A lock dir can exist with no pid file when the owner was killed before
+# it got to `echo "$$" > pid` — touch -t (not -d: its date syntax differs
+# between BSD and GNU touch) sets a fixed, unambiguously-old mtime the
+# same way on both platforms, no epoch arithmetic needed.
+new_fixture
+push_commit_from_dev "stale-lock-nopid commit"
+lockbase3="$(new_tmpdir)"
+lockdir3="$lockbase3/lock"
+mkdir -p "$lockdir3"
+touch -t 202001010000 "$lockdir3"
+run_deploy env GANGPLANK_LOCK_DIR="$lockdir3"
+assert_contains "$DEPLOY_LOG" "stale lock with no pid file removed" "stale lock, no pid file: log names the removal"
+assert_exit 0 "$DEPLOY_EXIT" "stale lock, no pid file: deploy still proceeds"
+assert_contains "$DEPLOY_LOG" "PULLED 1 commit(s)" "stale lock, no pid file: deploy actually pulled"
 
 # --- GANGPLANK_REPO unset -> bad config ---
 new_fixture
@@ -659,10 +787,11 @@ echo "local edit before a real pull" >> "$HOST/README.md"
 stub_bin record-on-park '{
   echo "FILES:$GANGPLANK_PARKED_FILES" >> "$ONPARK_LOG"
   echo "STASH:$GANGPLANK_STASH_NAME" >> "$ONPARK_LOG"
+  echo "RUNURL:$GANGPLANK_RUN_URL" >> "$ONPARK_LOG"
 }'
 onpark_log="$(new_tmpdir)/onpark.log"
 : > "$onpark_log"
-ONPARK_LOG="$onpark_log" run_deploy env GANGPLANK_ON_PARK="record-on-park"
+ONPARK_LOG="$onpark_log" run_deploy env GANGPLANK_ON_PARK="record-on-park" GANGPLANK_RUN_URL="https://example.test/run/1"
 assert_exit 0 "$DEPLOY_EXIT" "dirty+new commit: exits 0"
 assert_contains "$DEPLOY_LOG" "PARKED 1 file(s): README.md" "dirty+new commit: log names the parked file"
 stash_list_onpark="$(git -C "$HOST" stash list)"
@@ -670,6 +799,77 @@ assert_contains "$stash_list_onpark" "gangplank park" "dirty+new commit: stash p
 onpark_content="$(cat "$onpark_log" 2>/dev/null)"
 assert_contains "$onpark_content" "FILES:README.md" "dirty+new commit: on_park called with the parked file named"
 assert_contains "$onpark_content" "STASH:gangplank park" "dirty+new commit: on_park called with the stash name"
+assert_contains "$onpark_content" "RUNURL:https://example.test/run/1" "dirty+new commit: on_park sees GANGPLANK_RUN_URL when set"
+
+# --- on_park hook fails: non-fatal, deploy still exits 0 ---------------
+new_fixture
+push_commit_from_dev "onpark-fail commit"
+echo "local edit ahead of a failing on_park hook" >> "$HOST/README.md"
+stub_bin failing-on-park 'exit 7'
+run_deploy env GANGPLANK_ON_PARK="failing-on-park"
+assert_exit 0 "$DEPLOY_EXIT" "on_park hook fails: still exits 0 (non-fatal)"
+assert_contains "$DEPLOY_LOG" "PARKED 1 file(s): README.md" "on_park hook fails: parked file still logged"
+assert_contains "$DEPLOY_LOG" "hook: GANGPLANK_ON_PARK command failed (non-fatal)" "on_park hook fails: failure line logged"
+
+# --- multiple parked files are all named in the PARKED line -------------
+new_fixture
+push_commit_from_dev "multi-park commit"
+echo "edit one" >> "$HOST/README.md"
+echo "new untracked file" > "$HOST/scratch.txt"
+run_deploy env
+assert_exit 0 "$DEPLOY_EXIT" "multi-park: exits 0"
+assert_contains "$DEPLOY_LOG" "PARKED 2 file(s):" "multi-park: log names 2 files"
+assert_contains "$DEPLOY_LOG" "README.md" "multi-park: log lists README.md"
+assert_contains "$DEPLOY_LOG" "scratch.txt" "multi-park: log lists scratch.txt"
+stash_list_multipark="$(git -C "$HOST" stash list)"
+assert_contains "$stash_list_multipark" "gangplank park" "multi-park: stash present"
+
+# --- PARK FAILED: git stash push itself fails, deploy refused -----------
+new_fixture
+push_commit_from_dev "parkfail commit"
+echo "local edit that can never be parked" >> "$HOST/README.md"
+parkfail_git="$(fake_git_failing 'stash push*')"
+before_parkfail_head="$(git -C "$HOST" rev-parse HEAD)"
+run_deploy env PATH="$parkfail_git:$PATH"
+assert_exit 4 "$DEPLOY_EXIT" "park failed: exits 4"
+assert_contains "$DEPLOY_LOG" "PARK FAILED: git stash push failed" "park failed: log names the failure"
+after_parkfail_head="$(git -C "$HOST" rev-parse HEAD)"
+assert_eq "$before_parkfail_head" "$after_parkfail_head" "park failed: HEAD unchanged, nothing pulled"
+parkfail_readme="$(cat "$HOST/README.md")"
+assert_contains "$parkfail_readme" "local edit that can never be parked" "park failed: edit stays in the tree"
+
+# --- merge fails despite behind-only check: parked edits are restored ---
+new_fixture
+push_commit_from_dev "mergefail commit"
+echo "local edit to restore after a failed merge" >> "$HOST/README.md"
+mergefail_git="$(fake_git_failing 'merge --ff-only*')"
+before_mergefail_head="$(git -C "$HOST" rev-parse HEAD)"
+run_deploy env PATH="$mergefail_git:$PATH"
+assert_exit 4 "$DEPLOY_EXIT" "merge failed: exits 4"
+assert_contains "$DEPLOY_LOG" "MERGE FAILED despite behind-only check" "merge failed: log names the failure"
+assert_contains "$DEPLOY_LOG" "RESTORED parked edits — no deploy happened" "merge failed: log says edits were restored"
+after_mergefail_head="$(git -C "$HOST" rev-parse HEAD)"
+assert_eq "$before_mergefail_head" "$after_mergefail_head" "merge failed: HEAD unchanged"
+mergefail_readme="$(cat "$HOST/README.md")"
+assert_contains "$mergefail_readme" "local edit to restore after a failed merge" "merge failed: edit restored to the tree"
+mergefail_stash_list="$(git -C "$HOST" stash list)"
+assert_empty "$mergefail_stash_list" "merge failed: stash popped, nothing left in it"
+
+# --- merge AND the restoring stash pop both fail: edits stay in the stash
+new_fixture
+push_commit_from_dev "restorefail commit"
+echo "local edit stuck in the stash" >> "$HOST/README.md"
+restorefail_git="$(fake_git_failing 'merge --ff-only*|stash pop')"
+before_restorefail_head="$(git -C "$HOST" rev-parse HEAD)"
+run_deploy env PATH="$restorefail_git:$PATH"
+assert_exit 4 "$DEPLOY_EXIT" "restore failed: exits 4"
+assert_contains "$DEPLOY_LOG" "RESTORE FAILED: git stash pop failed" "restore failed: log names the failure"
+after_restorefail_head="$(git -C "$HOST" rev-parse HEAD)"
+assert_eq "$before_restorefail_head" "$after_restorefail_head" "restore failed: HEAD unchanged"
+restorefail_readme="$(cat "$HOST/README.md")"
+assert_not_contains "$restorefail_readme" "local edit stuck in the stash" "restore failed: edit not back in the tree (still stashed)"
+restorefail_stash_list="$(git -C "$HOST" stash list)"
+assert_contains "$restorefail_stash_list" "gangplank park" "restore failed: edit still recoverable from the stash"
 
 # --- clean tree with a pull to do: nothing parked, on_park never runs ---
 new_fixture
@@ -725,6 +925,51 @@ assert_contains "$DEPLOY_LOG" "hooks: resuming from ${pre_pull_sha}" "hook idemp
 resume_calls_content="$(cat "$resume_calls" 2>/dev/null)"
 assert_contains "$resume_calls_content" "bootstrap" "hook idempotency: resumed run re-ran the service hook"
 assert_eq "$post_pull_sha" "$(cat "$resume_marker" 2>/dev/null)" "hook idempotency: marker rewritten to HEAD after the resume"
+
+# --- up to date, resuming a stale marker's hooks: a hook fails -> exit 2
+new_fixture
+uptodate_fail_pre_sha="$(git -C "$HOST" rev-parse HEAD)"
+(
+  cd "$DEV" || exit 1
+  echo '{"name":"fixture","v":2}' > package.json
+  git add package.json
+  git commit -q -m "bump package.json for the resume-hook-failure case"
+  git push -q origin main
+)
+run_deploy env GANGPLANK_INSTALL="none"
+assert_exit 0 "$DEPLOY_EXIT" "up-to-date resume, hook fails: first (clean) pull exits 0"
+uptodate_fail_state_dir="$DEPLOY_STATE_DIR"
+uptodate_fail_marker="$uptodate_fail_state_dir/last-hooked-sha"
+printf '%s\n' "$uptodate_fail_pre_sha" > "$uptodate_fail_marker"
+run_deploy env GANGPLANK_INSTALL="package.json=false" GANGPLANK_STATE_DIR="$uptodate_fail_state_dir"
+assert_exit 2 "$DEPLOY_EXIT" "up-to-date resume, hook fails: exits 2"
+assert_contains "$DEPLOY_LOG" "up to date, nothing new to pull — hooks never finished last time" "up-to-date resume, hook fails: log says hooks never finished"
+assert_contains "$DEPLOY_LOG" "hooks: resuming from ${uptodate_fail_pre_sha}" "up-to-date resume, hook fails: log names the resume point"
+assert_contains "$DEPLOY_LOG" "EXIT 2: a hook failed" "up-to-date resume, hook fails: log names the exit-2 reason"
+assert_eq "false" "$(gh_output_value deployed)" "up-to-date resume, hook fails: deployed=false (nothing was pulled)"
+
+# --- a further pull resumes hooks from an even-older stale marker -------
+new_fixture
+further_resume_c0="$(git -C "$HOST" rev-parse HEAD)"
+push_commit_from_dev "further-resume first commit"
+run_deploy env
+assert_exit 0 "$DEPLOY_EXIT" "further resume: first pull exits 0"
+further_resume_state_dir="$DEPLOY_STATE_DIR"
+further_resume_marker="$further_resume_state_dir/last-hooked-sha"
+further_resume_c1="$(git -C "$HOST" rev-parse HEAD)"
+assert_eq "$further_resume_c1" "$(cat "$further_resume_marker" 2>/dev/null)" "further resume: marker matches HEAD after the first pull"
+push_commit_from_dev "further-resume second commit"
+# Rewind the marker further back than even the previous pull's start —
+# simulates a crash that predates the LAST successful deploy, not just
+# this one — so this run's own pre-merge SHA (further_resume_c1) is not
+# where hooks resume from; the older marker is.
+printf '%s\n' "$further_resume_c0" > "$further_resume_marker"
+run_deploy env GANGPLANK_STATE_DIR="$further_resume_state_dir"
+assert_exit 0 "$DEPLOY_EXIT" "further resume: second pull exits 0"
+assert_contains "$DEPLOY_LOG" "PULLED 1 commit(s)" "further resume: second pull log names 1 commit"
+assert_contains "$DEPLOY_LOG" "hooks: resuming from ${further_resume_c0}" "further resume: log names the older resume point, not the pre-merge SHA"
+further_resume_c2="$(git -C "$HOST" rev-parse HEAD)"
+assert_eq "$further_resume_c2" "$(cat "$further_resume_marker" 2>/dev/null)" "further resume: marker rewritten to the new HEAD"
 
 # --- marker already equals HEAD, up to date: no hook call at all -------
 new_fixture
@@ -793,6 +1038,141 @@ else
 fi
 logdir_calls_content="$(cat "$logdir_calls" 2>/dev/null)"
 assert_contains "$logdir_calls_content" "bootstrap" "plist log dirs: launchctl bootstrap still ran"
+
+# ============================================================================
+# extract_plist_value: the plutil path and the grep-fallback path, each
+# forced deterministically regardless of what the host actually has on
+# PATH (a real Mac has plutil; ubuntu-latest never does).
+# ============================================================================
+
+# --- plutil present (stubbed) and succeeds: its value wins, no fallback -
+new_fixture
+stub_bin launchctl 'echo "launchctl $*" >> "$LAUNCHCTL_CALLS_LOG"; exit 0'
+plutilok_home="$(new_tmpdir)"
+plutilok_out_dir="$(new_tmpdir)/plutil-stub-out"
+plutilok_err_dir="$(new_tmpdir)/plutil-stub-err"
+stub_bin plutil '
+  case "$2" in
+    StandardOutPath) printf "%s" "$PLUTILOK_OUT_VAL" ;;
+    StandardErrorPath) printf "%s" "$PLUTILOK_ERR_VAL" ;;
+  esac
+  exit 0
+'
+plutilok_calls="$(new_tmpdir)/launchctl-calls.log"
+: > "$plutilok_calls"
+(
+  cd "$DEV" || exit 1
+  mkdir -p services
+  # Deliberately unparseable as a real plist fragment (no <plist><dict>
+  # wrapper) — if the real, unstubbed plutil ever ran against this it
+  # would fail and fall through to grep; the stub is what must answer.
+  echo '<key>StandardOutPath</key><string>ignored-by-the-stub</string>' > services/ai.gangplank.plutilok.plist
+  git add services/ai.gangplank.plutilok.plist
+  git commit -q -m "add plutilok plist"
+  git push -q origin main
+)
+LAUNCHCTL_CALLS_LOG="$plutilok_calls" \
+  PLUTILOK_OUT_VAL="${plutilok_out_dir}/out.log" \
+  PLUTILOK_ERR_VAL="${plutilok_err_dir}/err.log" \
+  run_deploy env HOME="$plutilok_home" GANGPLANK_SERVICES_DIR="services"
+assert_exit 0 "$DEPLOY_EXIT" "plutil present: exits 0"
+if [ -d "$plutilok_out_dir" ]; then
+  pass "plutil present: StandardOutPath dir created from the plutil stub's value"
+else
+  fail "plutil present: StandardOutPath dir created from the plutil stub's value (missing $plutilok_out_dir)"
+fi
+if [ -d "$plutilok_err_dir" ]; then
+  pass "plutil present: StandardErrorPath dir created from the plutil stub's value"
+else
+  fail "plutil present: StandardErrorPath dir created from the plutil stub's value (missing $plutilok_err_dir)"
+fi
+
+# --- plutil absent (hidden from PATH): grep fallback extracts the value -
+# NOTE: this test builds its own restricted PATH via bindir_without, so it
+# writes its own launchctl stub straight into that dir rather than using
+# stub_bin — stub_bin's dir is shared across the whole file (the earlier
+# "plutil present" test already left a plutil stub in it), and prepending
+# it here would silently put plutil right back on PATH.
+new_fixture
+noplutil_home="$(new_tmpdir)"
+noplutil_dir="$(new_tmpdir)/grep-fallback-logs"
+noplutil_calls="$(new_tmpdir)/launchctl-calls.log"
+: > "$noplutil_calls"
+(
+  cd "$DEV" || exit 1
+  mkdir -p services
+  {
+    echo '<key>StandardOutPath</key>'
+    echo "<string>${noplutil_dir}/out.log</string>"
+    echo '<key>StandardErrorPath</key>'
+    echo "<string>${noplutil_dir}/err.log</string>"
+  } > services/ai.gangplank.noplutil.plist
+  git add services/ai.gangplank.noplutil.plist
+  git commit -q -m "add noplutil plist"
+  git push -q origin main
+)
+noplutil_bindir="$(bindir_without plutil)"
+cat > "$noplutil_bindir/launchctl" <<'EOF'
+#!/usr/bin/env bash
+echo "launchctl $*" >> "$LAUNCHCTL_CALLS_LOG"
+exit 0
+EOF
+chmod +x "$noplutil_bindir/launchctl"
+if [ -d "$noplutil_dir" ]; then
+  fail "plutil absent: log dir does not exist before the deploy (already present)"
+else
+  pass "plutil absent: log dir does not exist before the deploy"
+fi
+LAUNCHCTL_CALLS_LOG="$noplutil_calls" run_deploy env HOME="$noplutil_home" GANGPLANK_SERVICES_DIR="services" \
+  PATH="$noplutil_bindir"
+assert_exit 0 "$DEPLOY_EXIT" "plutil absent: exits 0"
+if [ -d "$noplutil_dir" ]; then
+  pass "plutil absent: grep fallback still found StandardOutPath/StandardErrorPath and created the dir"
+else
+  fail "plutil absent: grep fallback still found StandardOutPath/StandardErrorPath and created the dir (missing $noplutil_dir)"
+fi
+noplutil_calls_content="$(cat "$noplutil_calls" 2>/dev/null)"
+assert_contains "$noplutil_calls_content" "bootstrap" "plutil absent: launchctl bootstrap still ran"
+
+# --- only StandardErrorPath is set: StandardOutPath is skipped cleanly --
+new_fixture
+stub_bin launchctl 'echo "launchctl $*" >> "$LAUNCHCTL_CALLS_LOG"; exit 0'
+erronly_home="$(new_tmpdir)"
+erronly_out_dir="$(new_tmpdir)/erronly-out-should-not-exist"
+erronly_err_dir="$(new_tmpdir)/erronly-err"
+stub_bin plutil '
+  case "$2" in
+    StandardErrorPath) printf "%s" "$ERRONLY_ERR_VAL" ;;
+    StandardOutPath) printf "" ;;
+  esac
+  exit 0
+'
+erronly_calls="$(new_tmpdir)/launchctl-calls.log"
+: > "$erronly_calls"
+(
+  cd "$DEV" || exit 1
+  mkdir -p services
+  echo '<key>StandardErrorPath</key><string>ignored-by-the-stub</string>' > services/ai.gangplank.erronly.plist
+  git add services/ai.gangplank.erronly.plist
+  git commit -q -m "add erronly plist"
+  git push -q origin main
+)
+LAUNCHCTL_CALLS_LOG="$erronly_calls" \
+  ERRONLY_ERR_VAL="${erronly_err_dir}/err.log" \
+  run_deploy env HOME="$erronly_home" GANGPLANK_SERVICES_DIR="services"
+assert_exit 0 "$DEPLOY_EXIT" "StandardErrorPath only: exits 0"
+if [ -d "$erronly_err_dir" ]; then
+  pass "StandardErrorPath only: its log dir is created"
+else
+  fail "StandardErrorPath only: its log dir is created (missing $erronly_err_dir)"
+fi
+if [ -d "$erronly_out_dir" ]; then
+  fail "StandardErrorPath only: no StandardOutPath dir is invented (found $erronly_out_dir)"
+else
+  pass "StandardErrorPath only: no StandardOutPath dir is invented"
+fi
+erronly_calls_content="$(cat "$erronly_calls" 2>/dev/null)"
+assert_contains "$erronly_calls_content" "bootstrap" "StandardErrorPath only: launchctl bootstrap still ran"
 
 
 test_summary_and_exit
