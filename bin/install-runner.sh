@@ -37,6 +37,17 @@
 # the download/verify/extract flow against a small fixture instead of the
 # real multi-hundred-megabyte tarball. Never set them outside a test.
 #
+# GANGPLANK_TEST_SKIP_PLATFORM_CHECK=1 is a TEST-ONLY override that skips
+# the "refuse on non-arm64" check below entirely, so a test running on a
+# non-arm64 host (e.g. Linux CI) can reach the download/verify step to
+# exercise the sha256-mismatch refusal. Never set it outside a test.
+#
+# In --dry-run mode the non-arm64 refusal does not abort: it prints the
+# whole plan and ends with one NOTE line saying this host would be
+# refused, still exiting 0, so a dry run on any CI OS documents the full
+# plan. A real (non-dry-run) run keeps refusing first, before anything
+# else, and exits non-zero.
+#
 # Usage: install-runner.sh --repo <owner/name> [--runner-dir <path>]
 #   [--name <name>] [--labels <csv>] [--workflow <file.yml>]
 #   [--branch <name>] [--job <name>] [--path <PATH value>] [--dry-run]
@@ -107,13 +118,19 @@ FULL_LABELS="self-hosted,macOS,${LABELS}"
 ALLOWED_WORKFLOW_REF="${REPO_SLUG}/.github/workflows/${WORKFLOW}@refs/heads/${BRANCH}"
 ALLOWED_REF="refs/heads/${BRANCH}"
 
-case "$(uname -m)" in
-  arm64) ;;
-  *)
-    echo "install-runner.sh: refused — this Mac is not arm64 (uname -m = $(uname -m)); Intel Macs need a different runner asset (actions-runner-osx-x64), not the one pinned here" >&2
-    exit 1
-    ;;
-esac
+PLATFORM_REFUSAL_REASON=""
+if [ "${GANGPLANK_TEST_SKIP_PLATFORM_CHECK:-0}" != "1" ]; then
+  case "$(uname -m)" in
+    arm64) ;;
+    *)
+      PLATFORM_REFUSAL_REASON="this Mac is not arm64 (uname -m = $(uname -m)); Intel Macs need a different runner asset (actions-runner-osx-x64), not the one pinned here"
+      if [ "${DRY_RUN}" -eq 0 ]; then
+        echo "install-runner.sh: refused — ${PLATFORM_REFUSAL_REASON}" >&2
+        exit 1
+      fi
+      ;;
+  esac
+fi
 
 # --- 1. Download the pinned release ---------------------------------------
 ASSET_NAME="actions-runner-osx-arm64-${RUNNER_VERSION}.tar.gz"
@@ -233,7 +250,11 @@ if [ "${DRY_RUN}" -eq 1 ]; then
   plan "would render ${TEMPLATE} to ${INSTALLED_PLIST}"
   plan "would run: launchctl bootout gui/\$(id -u)/${LABEL} (if loaded), then launchctl bootstrap gui/\$(id -u) ${INSTALLED_PLIST}"
   plan "would verify: plist exists, launchctl print gui/\$(id -u)/${LABEL} shows state = running, installed hook sha256 matches repo copy, plist and .env both name ${HOOK_DEST}"
-  plan "install-runner.sh: dry run complete — nothing created under ${RUNNER_DIR}"
+  if [ -n "${PLATFORM_REFUSAL_REASON}" ]; then
+    plan "install-runner.sh: dry run complete — NOTE: this host would be refused: ${PLATFORM_REFUSAL_REASON}"
+  else
+    plan "install-runner.sh: dry run complete — nothing created under ${RUNNER_DIR}"
+  fi
   exit 0
 fi
 

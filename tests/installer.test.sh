@@ -81,6 +81,7 @@ exit 0
 out="$(mktemp)"; err="$(mktemp)"
 GANGPLANK_TEST_RUNNER_VERSION="0.0.0-test" \
 GANGPLANK_TEST_RUNNER_SHA256="0000000000000000000000000000000000000000000000000000000000aa" \
+GANGPLANK_TEST_SKIP_PLATFORM_CHECK=1 \
 bash "$INSTALLER" --repo owner/repo --runner-dir "$runner_dir2" >"$out" 2>"$err"
 ec=$?
 mismatch_out="$(cat "$out")"
